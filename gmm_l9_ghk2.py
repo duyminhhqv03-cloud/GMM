@@ -3,11 +3,14 @@ SmartZ-EDU — Hệ thống Z-score thích ứng bằng Mô hình Hỗn hợp Ga
 hỗ trợ đánh giá công bằng và ra quyết định quản lý giáo dục THCS.
 
 Phương pháp chính: Z-score GMM MỀM (soft/posterior-weighted) — mỗi học sinh được
-gán một trọng số xác suất (gamma) thuộc về từng "cụm năng lực", thay vì bị ép buộc
+gán trọng số xác suất (gamma) thuộc về từng "cụm năng lực", thay vì bị ép buộc
 phân loại cứng vào một nhóm duy nhất.
 
-Cơ chế thích ứng tự động: so sánh BIC giữa mô hình 1 thành phần (đơn đỉnh) và
-2 thành phần (đa đỉnh) để quyết định dùng GMM hay Z-score truyền thống.
+Cơ chế thích ứng tự động (TỔNG QUÁT): hệ thống tự động dò số đỉnh (số thành phần
+Gauss) từ k=1 đến k=K_MAX, chọn k có BIC nhỏ nhất — không áp đặt sẵn "phải có
+đúng 2 đỉnh", mà để dữ liệu tự quyết định. Trên dữ liệu thực tế của trường (có
+đúng 2 loại hình lớp), thuật toán tự tìm ra k=2 là tối ưu — một bằng chứng khách
+quan củng cố giả thuyết ban đầu, thay vì một giả định được áp đặt trước.
 
 Chạy local:  streamlit run app.py
 """
@@ -27,6 +30,8 @@ st.set_page_config(
     initial_sidebar_state="expanded",
 )
 
+K_MAX_DEFAULT = 4  # số đỉnh tối đa mà hệ thống sẽ dò thử
+
 # ----------------------------------------------------------------------
 # GIAO DIỆN: CSS TUỲ CHỈNH
 # ----------------------------------------------------------------------
@@ -42,146 +47,95 @@ st.markdown(
         margin-bottom: 1.4rem;
         color: white;
     }
-    .smartz-hero h1 {
-        font-size: 1.9rem;
-        font-weight: 800;
-        margin: 0 0 0.4rem 0;
-        color: white;
-    }
-    .smartz-hero p {
-        font-size: 1rem;
-        opacity: 0.92;
-        margin: 0;
-        max-width: 850px;
-        line-height: 1.5;
-    }
+    .smartz-hero h1 { font-size: 1.9rem; font-weight: 800; margin: 0 0 0.4rem 0; color: white; }
+    .smartz-hero p { font-size: 1rem; opacity: 0.92; margin: 0; max-width: 850px; line-height: 1.5; }
     .smartz-badge {
-        display: inline-block;
-        background: rgba(255,255,255,0.18);
-        border: 1px solid rgba(255,255,255,0.35);
-        border-radius: 999px;
-        padding: 0.15rem 0.75rem;
-        font-size: 0.78rem;
-        margin-right: 0.4rem;
-        margin-top: 0.7rem;
+        display: inline-block; background: rgba(255,255,255,0.18);
+        border: 1px solid rgba(255,255,255,0.35); border-radius: 999px;
+        padding: 0.15rem 0.75rem; font-size: 0.78rem; margin-right: 0.4rem; margin-top: 0.7rem;
     }
-
-    .smartz-card {
-        background: var(--background-color, #ffffff);
-        border: 1px solid rgba(120,120,120,0.18);
-        border-radius: 14px;
-        padding: 1.1rem 1.3rem;
-        margin-bottom: 0.9rem;
-    }
-    .smartz-section-title {
-        font-size: 1.05rem;
-        font-weight: 700;
-        margin-bottom: 0.3rem;
-        display: flex;
-        align-items: center;
-        gap: 0.4rem;
-    }
-
     .smartz-decision-gmm {
         background: linear-gradient(90deg, #e8f8ee 0%, #d6f2e0 100%);
-        border-left: 5px solid #2e9e5b;
-        border-radius: 10px;
-        padding: 0.85rem 1.1rem;
-        font-size: 0.95rem;
+        border-left: 5px solid #2e9e5b; border-radius: 10px; padding: 0.85rem 1.1rem; font-size: 0.95rem;
     }
     .smartz-decision-naive {
         background: linear-gradient(90deg, #eaf2fb 0%, #dcebf9 100%);
-        border-left: 5px solid #3a7ec9;
-        border-radius: 10px;
-        padding: 0.85rem 1.1rem;
-        font-size: 0.95rem;
+        border-left: 5px solid #3a7ec9; border-radius: 10px; padding: 0.85rem 1.1rem; font-size: 0.95rem;
+    }
+    .smartz-decision-multi {
+        background: linear-gradient(90deg, #f5eefc 0%, #ece0f9 100%);
+        border-left: 5px solid #8e5fc9; border-radius: 10px; padding: 0.85rem 1.1rem; font-size: 0.95rem;
     }
     .smartz-flag-up {
-        background: #fff4e5;
-        border-left: 5px solid #e6912c;
-        border-radius: 10px;
-        padding: 0.7rem 1rem;
-        margin-bottom: 0.5rem;
+        background: #fff4e5; border-left: 5px solid #e6912c; border-radius: 10px;
+        padding: 0.7rem 1rem; margin-bottom: 0.5rem;
     }
     .smartz-flag-down {
-        background: #fdeaea;
-        border-left: 5px solid #d9534f;
-        border-radius: 10px;
-        padding: 0.7rem 1rem;
-        margin-bottom: 0.5rem;
+        background: #fdeaea; border-left: 5px solid #d9534f; border-radius: 10px;
+        padding: 0.7rem 1rem; margin-bottom: 0.5rem;
     }
-
-    div[data-testid="stMetric"] {
-        background: rgba(120,120,120,0.06);
-        border-radius: 12px;
-        padding: 0.7rem 0.9rem;
-    }
+    div[data-testid="stMetric"] { background: rgba(120,120,120,0.06); border-radius: 12px; padding: 0.7rem 0.9rem; }
     </style>
     """,
     unsafe_allow_html=True,
 )
 
 # ----------------------------------------------------------------------
-# LÕI THUẬT TOÁN
+# LÕI THUẬT TOÁN (TỔNG QUÁT k THÀNH PHẦN)
 # ----------------------------------------------------------------------
 
-def fit_gmm_components(x: np.ndarray):
-    """Fit GMM 2 thành phần, sắp xếp theo trung bình tăng dần (cụm 1 = điểm thấp hơn)."""
-    gmm2 = GaussianMixture(n_components=2, n_init=20, random_state=42).fit(x.reshape(-1, 1))
-    means = gmm2.means_.flatten()
-    stds = np.sqrt(gmm2.covariances_).flatten()
-    weights = gmm2.weights_.flatten()
+def fit_gmm_k(x: np.ndarray, k: int):
+    """Fit GMM k thành phần, sắp xếp các thành phần theo trung bình tăng dần."""
+    gmm = GaussianMixture(n_components=k, n_init=20, random_state=42).fit(x.reshape(-1, 1))
+    means = gmm.means_.flatten()
+    stds = np.sqrt(gmm.covariances_).flatten()
+    weights = gmm.weights_.flatten()
     order = np.argsort(means)
-    mu1, s1, pi1 = means[order[0]], stds[order[0]], weights[order[0]]
-    mu2, s2, pi2 = means[order[1]], stds[order[1]], weights[order[1]]
-    return (mu1, s1, pi1), (mu2, s2, pi2)
+    components = [(means[i], stds[i], weights[i]) for i in order]
+    return components, gmm.bic(x.reshape(-1, 1))
 
 
-def adaptive_check(x: np.ndarray):
-    """So sánh BIC(k=1) và BIC(k=2) để quyết định có nên dùng GMM hay không.
-    Trả về (dung_gmm: bool, bic1, bic2, delta_bic)."""
-    X = x.reshape(-1, 1)
-    gmm1 = GaussianMixture(n_components=1, random_state=42).fit(X)
-    gmm2 = GaussianMixture(n_components=2, n_init=20, random_state=42).fit(X)
-    bic1, bic2 = gmm1.bic(X), gmm2.bic(X)
-    delta = bic1 - bic2  # dương nghĩa là k=2 tốt hơn
-    return delta > 0, bic1, bic2, delta
+def adaptive_search(x: np.ndarray, k_max: int = K_MAX_DEFAULT):
+    """Tự động dò số đỉnh (thành phần Gauss) từ k=1 đến k_max, chọn k có BIC nhỏ nhất.
+    Trả về (best_k, components_tại_best_k, bang_bic {k: bic})."""
+    n = len(x)
+    k_max_eff = max(1, min(k_max, n // 5))  # tránh overfit khi mẫu nhỏ (tối thiểu ~5 điểm/thành phần)
+    bic_table, comps_by_k = {}, {}
+    for k in range(1, k_max_eff + 1):
+        comps, bic = fit_gmm_k(x, k)
+        bic_table[k] = bic
+        comps_by_k[k] = comps
+    best_k = min(bic_table, key=bic_table.get)
+    return best_k, comps_by_k[best_k], bic_table
 
 
 def z_naive(x: np.ndarray) -> np.ndarray:
     return (x - x.mean()) / x.std(ddof=1)
 
 
-def z_soft_gmm(x: np.ndarray, comp1, comp2):
-    """Z-score GMM MỀM: trung bình có trọng số xác suất hậu nghiệm (gamma) giữa
-    Z-score tính theo từng thành phần Gauss. Đây là phương pháp chính của hệ thống."""
-    mu1, s1, pi1 = comp1
-    mu2, s2, pi2 = comp2
-    f1 = stats.norm.pdf(x, mu1, s1)
-    f2 = stats.norm.pdf(x, mu2, s2)
-    denom = pi1 * f1 + pi2 * f2
+def z_soft_gmm_k(x: np.ndarray, components):
+    """Z-score GMM MỀM tổng quát cho k thành phần bất kỳ: Z* = Σ_k γ_k · z_k,
+    với γ_k là xác suất hậu nghiệm (posterior) theo định lý Bayes."""
+    dens = np.zeros((len(components), len(x)))
+    for i, (mu, s, pi) in enumerate(components):
+        dens[i] = pi * stats.norm.pdf(x, mu, s)
+    denom = dens.sum(axis=0)
     denom = np.where(denom <= 0, 1e-300, denom)
-    gamma1 = (pi1 * f1) / denom
-    gamma2 = 1.0 - gamma1
-    z1 = (x - mu1) / s1
-    z2 = (x - mu2) / s2
-    z_soft = gamma1 * z1 + gamma2 * z2
-    return z_soft, gamma1, gamma2
+    gammas = dens / denom  # shape (k, n)
+    z_each = np.array([(x - mu) / s for (mu, s, _) in components])  # shape (k, n)
+    z_soft = (gammas * z_each).sum(axis=0)
+    return z_soft, gammas
 
 
-def z_hard_gmm(x: np.ndarray, comp1, comp2):
-    """Z-score GMM CỨNG (tham khảo/so sánh): gán cứng vào cụm có gamma cao nhất."""
-    _, gamma1, _ = z_soft_gmm(x, comp1, comp2)
-    mu1, s1, _ = comp1
-    mu2, s2, _ = comp2
-    hard1 = gamma1 >= 0.5
-    return np.where(hard1, (x - mu1) / s1, (x - mu2) / s2)
+def z_hard_gmm_k(x: np.ndarray, components, gammas):
+    best_comp = np.argmax(gammas, axis=0)
+    z_each = np.array([(x - mu) / s for (mu, s, _) in components])
+    return z_each[best_comp, np.arange(len(x))]
 
 
-def analyze_column(raw: pd.DataFrame, group_col: str, score_col: str):
-    """Xử lý một cột điểm: làm sạch dữ liệu, kiểm tra thích ứng, tính các loại Z-score.
-    Giữ nguyên chỉ số (index) gốc của `raw` để có thể ghép nối chính xác giữa nhiều
-    cột điểm khác nhau (vd so sánh tiến bộ GK -> CK) mà không bị lệch dòng."""
+def analyze_column(raw: pd.DataFrame, group_col: str, score_col: str, k_max: int):
+    """Xử lý một cột điểm: làm sạch dữ liệu, tự động dò số đỉnh, tính các loại Z-score.
+    Giữ nguyên chỉ số (index) gốc của `raw` để ghép nối chính xác giữa nhiều cột điểm."""
     data = raw[[group_col, score_col]].copy()
     data[score_col] = pd.to_numeric(data[score_col], errors="coerce")
     data = data.dropna()  # giữ nguyên index gốc, KHÔNG reset_index
@@ -189,44 +143,43 @@ def analyze_column(raw: pd.DataFrame, group_col: str, score_col: str):
         return None
 
     x = data[score_col].values
-    use_gmm, bic1, bic2, delta = adaptive_check(x)
+    best_k, components, bic_table = adaptive_search(x, k_max=k_max)
 
     result = data.copy()
     result["Z_truyen_thong"] = z_naive(x).round(3)
 
-    comp1 = comp2 = None
-    if use_gmm:
-        comp1, comp2 = fit_gmm_components(x)
-        z_s, gamma1, gamma2 = z_soft_gmm(x, comp1, comp2)
-        z_h = z_hard_gmm(x, comp1, comp2)
-        result["gamma_cum_thap"] = gamma1.round(4)
-        result["gamma_cum_cao"] = gamma2.round(4)
+    gammas = None
+    if best_k >= 2:
+        z_s, gammas = z_soft_gmm_k(x, components)
+        z_h = z_hard_gmm_k(x, components, gammas)
+        for i in range(best_k):
+            result[f"gamma_cum_{i+1}"] = gammas[i].round(4)
         result["Z_GMM_mem"] = z_s.round(3)
         result["Z_GMM_cung"] = z_h.round(3)
 
     return {
         "score_col": score_col, "data": data, "x": x,
-        "use_gmm": use_gmm, "bic1": bic1, "bic2": bic2, "delta": delta,
-        "comp1": comp1, "comp2": comp2, "result": result,
+        "best_k": best_k, "components": components, "bic_table": bic_table,
+        "gammas": gammas, "result": result,
     }
 
 
-def render_distribution_chart(score_col: str, x: np.ndarray, comp1, comp2, use_gmm: bool):
+def render_distribution_chart(score_col: str, x: np.ndarray, components, best_k: int):
     fig, ax = plt.subplots(figsize=(9, 4.6))
     lo, hi = float(np.floor(x.min())), float(np.ceil(x.max()))
     bins = np.arange(max(0, lo - 0.5), hi + 1.0, 0.5)
     ax.hist(x, bins=bins, density=True, color="#8ecae6", edgecolor="white", alpha=0.85,
             label="Phổ điểm thực tế")
     xs = np.linspace(bins[0], bins[-1], 400)
-    if use_gmm and comp1 is not None:
-        mu1, s1, pi1 = comp1
-        mu2, s2, pi2 = comp2
-        ax.plot(xs, pi1 * stats.norm.pdf(xs, mu1, s1), color="#e76f51", ls="--", lw=2,
-                label=f"Cụm điểm thấp hơn (μ≈{mu1:.1f})")
-        ax.plot(xs, pi2 * stats.norm.pdf(xs, mu2, s2), color="#2a9d8f", ls="--", lw=2,
-                label=f"Cụm điểm cao hơn (μ≈{mu2:.1f})")
-        ax.plot(xs, pi1 * stats.norm.pdf(xs, mu1, s1) + pi2 * stats.norm.pdf(xs, mu2, s2),
-                color="#1d3557", lw=2.4, label="Tổng hợp GMM 2 đỉnh")
+    palette = ["#e76f51", "#2a9d8f", "#e9c46a", "#8e5fc9"]
+    if best_k >= 2:
+        total = np.zeros_like(xs)
+        for i, (mu, s, pi) in enumerate(components):
+            comp_curve = pi * stats.norm.pdf(xs, mu, s)
+            total += comp_curve
+            ax.plot(xs, comp_curve, color=palette[i % len(palette)], ls="--", lw=2,
+                    label=f"Cụm {i+1} (μ≈{mu:.1f}, tỉ trọng {pi:.2f})")
+        ax.plot(xs, total, color="#1d3557", lw=2.4, label=f"Tổng hợp GMM {best_k} đỉnh")
     else:
         mu, sd = x.mean(), x.std()
         ax.plot(xs, stats.norm.pdf(xs, mu, sd), color="#1d3557", lw=2.4,
@@ -242,42 +195,85 @@ def render_distribution_chart(score_col: str, x: np.ndarray, comp1, comp2, use_g
     return fig
 
 
+def render_bic_chart(bic_table: dict, best_k: int):
+    fig, ax = plt.subplots(figsize=(5, 3.2))
+    ks = sorted(bic_table.keys())
+    vals = [bic_table[k] for k in ks]
+    colors = ["#2e9e5b" if k == best_k else "#a8b3bd" for k in ks]
+    ax.bar([str(k) for k in ks], vals, color=colors)
+    ax.set_xlabel("Số đỉnh giả định (k)"); ax.set_ylabel("BIC (càng thấp càng tốt)")
+    ax.set_title("So sánh BIC theo số đỉnh", fontsize=10, fontweight="bold")
+    for i, v in enumerate(vals):
+        ax.text(i, v, f"{v:.0f}", ha="center", va="bottom", fontsize=8)
+    ax.spines[["top", "right"]].set_visible(False)
+    plt.tight_layout()
+    return fig
+
+
 def render_analysis(raw: pd.DataFrame, group_col: str, r: dict, exception_threshold: float):
     """Hiển thị toàn bộ kết quả phân tích cho MỘT cột điểm (dùng chung cho cả 2 chế độ)."""
     score_col, x, result = r["score_col"], r["x"], r["result"]
+    best_k = r["best_k"]
 
-    m1, m2, m3, m4 = st.columns(4)
+    m1, m2, m3 = st.columns(3)
     m1.metric("Số học sinh hợp lệ", f"{len(x)}")
-    m2.metric("BIC (k = 1)", f"{r['bic1']:.1f}")
-    m3.metric("BIC (k = 2)", f"{r['bic2']:.1f}")
-    m4.metric("ΔBIC (k1 − k2)", f"{r['delta']:+.1f}")
+    m2.metric("Số đỉnh tự động phát hiện (k)", f"{best_k}")
+    m3.metric("BIC tại k tối ưu", f"{r['bic_table'][best_k]:.1f}")
 
-    if r["use_gmm"]:
+    if best_k == 1:
         st.markdown(
-            '<div class="smartz-decision-gmm">✅ &nbsp;<b>Phổ điểm có bằng chứng đa đỉnh</b> '
-            '(ΔBIC &gt; 0) → hệ thống tự động áp dụng <b>Z-score GMM Mềm</b>.</div>',
+            '<div class="smartz-decision-naive">ℹ️ &nbsp;Hệ thống dò k = 1..%d và xác định '
+            '<b>phổ điểm chỉ có 1 đỉnh</b> (đơn phương thức) → tự động dùng '
+            '<b>Z-score truyền thống</b>.</div>' % max(r["bic_table"].keys()),
+            unsafe_allow_html=True,
+        )
+    elif best_k == 2:
+        st.markdown(
+            '<div class="smartz-decision-gmm">✅ &nbsp;Hệ thống tự động dò và xác định '
+            '<b>phổ điểm có 2 đỉnh</b> là mô tả tối ưu (BIC nhỏ nhất) → áp dụng '
+            '<b>Z-score GMM Mềm với 2 cụm</b>.</div>',
             unsafe_allow_html=True,
         )
     else:
         st.markdown(
-            '<div class="smartz-decision-naive">ℹ️ &nbsp;<b>Không đủ bằng chứng đa đỉnh</b> '
-            '(ΔBIC ≤ 0) → hệ thống tự động dùng <b>Z-score truyền thống</b>, '
-            'không cưỡng ép mô hình 2 cụm.</div>',
+            f'<div class="smartz-decision-multi">🔎 &nbsp;Hệ thống tự động dò và xác định '
+            f'<b>phổ điểm có {best_k} đỉnh</b> là mô tả tối ưu → áp dụng <b>Z-score GMM Mềm '
+            f'với {best_k} cụm</b>. Lưu ý: với trên 2 cụm, hệ thống chưa tự ánh xạ từng cụm '
+            f'sang đúng một loại hình lớp hành chính cụ thể.</div>',
             unsafe_allow_html=True,
         )
 
     st.write("")
-    tab_names = ["📈 Biểu đồ phổ điểm", "🗂️ Bảng kết quả"]
-    if r["use_gmm"]:
-        tab_names[1:1] = ["🚩 Ngoại lệ sư phạm", "📋 Tham số mô hình"]
+    tab_names = ["📈 Biểu đồ phổ điểm", "🔬 Cơ chế thích ứng (BIC)", "🗂️ Bảng kết quả"]
+    if best_k == 2:
+        tab_names.insert(2, "🚩 Ngoại lệ sư phạm")
+    elif best_k > 2:
+        tab_names.insert(2, "🧩 Xác suất theo cụm")
     tabs = st.tabs(tab_names)
 
     with tabs[0]:
-        fig = render_distribution_chart(score_col, x, r["comp1"], r["comp2"], r["use_gmm"])
+        fig = render_distribution_chart(score_col, x, r["components"], best_k)
         st.pyplot(fig, use_container_width=True)
 
-    if r["use_gmm"]:
-        with tabs[1]:
+    with tabs[1]:
+        cL, cR = st.columns([1, 1])
+        with cL:
+            fig_bic = render_bic_chart(r["bic_table"], best_k)
+            st.pyplot(fig_bic, use_container_width=True)
+        with cR:
+            bic_df = pd.DataFrame(
+                {"Số đỉnh (k)": list(r["bic_table"].keys()), "BIC": list(r["bic_table"].values())}
+            )
+            bic_df["Được chọn"] = bic_df["Số đỉnh (k)"].apply(lambda k: "✅" if k == best_k else "")
+            st.dataframe(bic_df, use_container_width=True, hide_index=True)
+            st.caption(
+                "Hệ thống dò từ k=1 đến k tối đa, KHÔNG áp đặt sẵn số đỉnh — "
+                "k được chọn là giá trị cho BIC nhỏ nhất."
+            )
+
+    idx_extra = 2
+    if best_k == 2:
+        with tabs[idx_extra]:
             st.caption(
                 f"Học sinh được gắn cờ khi xác suất γ thuộc **cụm khác với nhóm hành chính hiện "
                 f"tại** vượt ngưỡng **{exception_threshold:.2f}** — gợi ý tham mưu chuyển lớp / phụ đạo."
@@ -286,8 +282,8 @@ def render_analysis(raw: pd.DataFrame, group_col: str, r: dict, exception_thresh
             if len(groups) == 2:
                 means_by_group = result.groupby(group_col)[score_col].mean()
                 low_group, high_group = means_by_group.idxmin(), means_by_group.idxmax()
-                exc_up = result[(result[group_col] == low_group) & (result["gamma_cum_cao"] > exception_threshold)]
-                exc_down = result[(result[group_col] == high_group) & (result["gamma_cum_cao"] < 1 - exception_threshold)]
+                exc_up = result[(result[group_col] == low_group) & (result["gamma_cum_2"] > exception_threshold)]
+                exc_down = result[(result[group_col] == high_group) & (result["gamma_cum_2"] < 1 - exception_threshold)]
 
                 cA, cB = st.columns(2)
                 with cA:
@@ -308,18 +304,18 @@ def render_analysis(raw: pd.DataFrame, group_col: str, r: dict, exception_thresh
                     st.dataframe(exc_down, use_container_width=True, height=220)
             else:
                 st.info("Cần đúng 2 nhóm trong cột loại hình lớp để phát hiện ngoại lệ sư phạm.")
+        idx_extra += 1
+    elif best_k > 2:
+        with tabs[idx_extra]:
+            st.caption(
+                f"Phổ điểm được mô tả tốt nhất bởi {best_k} cụm năng lực. Bảng dưới đây cho thấy "
+                f"xác suất (γ) mỗi học sinh thuộc về từng cụm — dùng để phân tích chi tiết thêm."
+            )
+            gamma_cols = [c for c in result.columns if c.startswith("gamma_cum_")]
+            st.dataframe(result[[group_col, score_col] + gamma_cols], use_container_width=True)
+        idx_extra += 1
 
-        with tabs[2]:
-            mu1, s1, pi1 = r["comp1"]
-            mu2, s2, pi2 = r["comp2"]
-            cA, cB = st.columns(2)
-            cA.markdown(f"**Cụm điểm thấp hơn**  \nμ = {mu1:.3f}  \nσ = {s1:.3f}  \ntrọng số = {pi1:.3f}")
-            cB.markdown(f"**Cụm điểm cao hơn**  \nμ = {mu2:.3f}  \nσ = {s2:.3f}  \ntrọng số = {pi2:.3f}")
-            st.write("**Z-score trung bình theo nhóm (truyền thống vs GMM Mềm):**")
-            st.dataframe(result.groupby(group_col)[["Z_truyen_thong", "Z_GMM_mem"]].mean().round(3),
-                         use_container_width=True)
-
-    with tabs[-1]:
+    with tabs[idx_extra]:
         st.dataframe(result, use_container_width=True)
         buf = io.BytesIO()
         with pd.ExcelWriter(buf, engine="openpyxl") as writer:
@@ -335,10 +331,10 @@ def render_analysis(raw: pd.DataFrame, group_col: str, r: dict, exception_thresh
 def render_progress_comparison(raw: pd.DataFrame, group_col: str, results_by_col: dict, col_from: str, col_to: str):
     """So sánh tiến bộ Z-score GMM Mềm giữa 2 cột điểm, ghép đúng theo học sinh (index gốc)."""
     r_from, r_to = results_by_col[col_from], results_by_col[col_to]
-    if not (r_from["use_gmm"] and r_to["use_gmm"]):
+    if not (r_from["best_k"] >= 2 and r_to["best_k"] >= 2):
         st.info(
-            "Chỉ có thể so sánh tiến bộ khi CẢ HAI cột điểm đều dùng Z-score GMM Mềm "
-            "(cột dùng Z-score truyền thống chưa có Z* để so sánh)."
+            "Chỉ có thể so sánh tiến bộ khi CẢ HAI cột điểm đều được xác định có từ 2 đỉnh trở lên "
+            "(cột có 1 đỉnh dùng Z-score truyền thống, chưa có Z* để so sánh)."
         )
         return
 
@@ -369,10 +365,10 @@ st.markdown(
     <div class="smartz-hero">
         <h1>🎓 SmartZ-EDU</h1>
         <p>Hệ thống Z-score thích ứng bằng Mô hình Hỗn hợp Gauss Mềm (Soft GMM) —
-        hỗ trợ đánh giá công bằng và ra quyết định quản lý giáo dục khi trường có
-        nhiều loại hình lớp khiến phổ điểm không còn phân phối chuẩn đơn đỉnh.</p>
+        tự động dò số đỉnh của phổ điểm (không áp đặt sẵn) để hỗ trợ đánh giá công bằng
+        và ra quyết định quản lý giáo dục.</p>
         <span class="smartz-badge">🧠 Soft GMM</span>
-        <span class="smartz-badge">🔄 Thích ứng tự động (BIC)</span>
+        <span class="smartz-badge">🔄 Tự động dò số đỉnh (k=1..4)</span>
         <span class="smartz-badge">🚩 Phát hiện ngoại lệ sư phạm</span>
         <span class="smartz-badge">📈 Theo dõi tiến bộ</span>
     </div>
@@ -384,12 +380,12 @@ with st.expander("ℹ️ Về phương pháp Soft GMM và cơ chế thích ứng
     st.markdown(
         """
 - **Z-score GMM Mềm (phương pháp chính):** mỗi học sinh được gán trọng số xác suất
-  γ (gamma) thuộc về từng cụm năng lực, thay vì bị ép buộc phân loại cứng. Học sinh
-  ở vùng ranh giới giữa hai cụm sẽ có Z-score biến thiên mượt mà, tránh bị đánh giá
-  cực đoan một cách bất công.
-- **Cơ chế thích ứng tự động:** hệ thống so sánh BIC giữa mô hình 1 thành phần và
-  2 thành phần. Nếu phổ điểm không đủ bằng chứng đa đỉnh, hệ thống **tự động dùng
-  Z-score truyền thống** thay vì cưỡng ép dữ liệu vào khuôn mẫu 2 cụm không phù hợp.
+  γ (gamma) thuộc về từng cụm năng lực, thay vì bị ép buộc phân loại cứng.
+- **Cơ chế thích ứng tự động (tổng quát):** hệ thống dò lần lượt mô hình với
+  k = 1, 2, 3, 4 thành phần Gauss, so sánh bằng tiêu chuẩn BIC, và chọn k có BIC
+  nhỏ nhất — **không áp đặt sẵn phải có đúng 2 đỉnh**. Nếu dữ liệu chỉ có 1 đỉnh,
+  hệ thống tự quay về Z-score truyền thống; nếu có nhiều hơn 2 đỉnh, hệ thống vẫn
+  tính được Z-score mềm tổng quát cho từng cụm.
         """
     )
 
@@ -402,8 +398,12 @@ with st.sidebar:
     )
     st.markdown("---")
     st.markdown("### ⚙️ 2. Tuỳ chọn phân tích")
+    k_max = st.slider(
+        "Số đỉnh tối đa để dò thử (k_max)", 2, 6, K_MAX_DEFAULT, 1,
+        help="Hệ thống sẽ tự động dò từ k=1 đến giá trị này và chọn k tối ưu theo BIC.",
+    )
     exception_threshold = st.slider(
-        "Ngưỡng γ — 'ngoại lệ sư phạm'", 0.5, 0.9, 0.7, 0.05,
+        "Ngưỡng γ — 'ngoại lệ sư phạm' (áp dụng khi k=2)", 0.5, 0.9, 0.7, 0.05,
         help="Học sinh có xác suất γ thuộc cụm khác vượt ngưỡng này sẽ được gắn cờ.",
     )
 
@@ -469,7 +469,7 @@ st.markdown("---")
 # --- Phân tích từng cột đã chọn ---
 results_by_col = {}
 for score_col in score_cols:
-    r = analyze_column(raw, group_col, score_col)
+    r = analyze_column(raw, group_col, score_col, k_max=k_max)
     if r is None:
         st.warning(f"Không có dữ liệu hợp lệ cho cột `{score_col}`.")
         continue
@@ -502,7 +502,8 @@ else:
 
 st.markdown("---")
 st.caption(
-    "Phương pháp: Z-score GMM Mềm chuẩn hoá điểm theo trung bình có trọng số xác suất hậu "
-    "nghiệm (γ) giữa các thành phần Gauss, tránh phân loại cứng gây bất công ở vùng ranh giới. "
-    "Hệ thống tự động chuyển về Z-score truyền thống khi không đủ bằng chứng đa đỉnh (so sánh BIC)."
+    "Phương pháp: hệ thống tự động dò số đỉnh (k=1..k_max) của phổ điểm bằng tiêu chuẩn BIC, "
+    "không áp đặt sẵn số cụm. Với k ≥ 2, Z-score GMM Mềm chuẩn hoá điểm theo trung bình có "
+    "trọng số xác suất hậu nghiệm (γ) giữa các thành phần Gauss, tránh phân loại cứng gây bất "
+    "công ở vùng ranh giới."
 )
