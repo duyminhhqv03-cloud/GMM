@@ -588,8 +588,22 @@ def get_sheets(file_bytes: bytes, filename: str):
 
 
 @st.cache_data(show_spinner=False)
-def run_analysis(name: str, x: np.ndarray, groups, k_override):
-    return analyse_column(name, x, groups, k_override=k_override)
+def _run_analysis_cached(name: str, x_t: tuple, g_t, k_override):
+    x = np.asarray(x_t, dtype=float)
+    g = None if g_t is None else np.array(g_t, dtype=object)
+    return analyse_column(name, x, g, k_override=k_override)
+
+
+def run_analysis(name, x, groups, k_override):
+    """Chuyển dữ liệu về tuple thuần để Streamlit băm được (tương thích pandas 3 / Python 3.14)."""
+    x_t = tuple(float(v) for v in np.asarray(x, dtype=float))
+    g_t = None if groups is None else tuple(str(v) for v in groups)
+    return _run_analysis_cached(str(name), x_t, g_t, k_override)
+
+
+def str_values(series) -> np.ndarray:
+    """Cột chữ -> mảng numpy object thuần (tránh ArrowStringArray của pandas 3)."""
+    return np.array([str(v) for v in series.tolist()], dtype=object)
 
 
 def fmt(v, nd=2):
@@ -690,7 +704,7 @@ with st.spinner("Đang ước lượng mô hình hỗn hợp Gauss…"):
         if len(sub) < 20:
             st.error(f"Cột **{c}** chỉ có {len(sub)} giá trị hợp lệ — cần tối thiểu 20.")
             st.stop()
-        groups = sub[group_col].astype(str).values if group_col else None
+        groups = str_values(sub[group_col]) if group_col else None
         res = run_analysis(c, sub[c].to_numpy(dtype=float), groups, k_override)
         for name, vals in res.scores.items():
             sub[name] = vals
@@ -706,7 +720,7 @@ with tab1:
     col_tabs = st.tabs(score_cols) if len(score_cols) > 1 else [st.container()]
     for c, ct in zip(score_cols, col_tabs):
         res, sub = results[c], subsets[c]
-        groups = sub[group_col].astype(str).values if group_col else None
+        groups = str_values(sub[group_col]) if group_col else None
         with ct:
             sel = res.selection
             d12 = sel["delta_1_to_2"]
@@ -803,7 +817,7 @@ with tab2:
     elif not group_col:
         st.warning("Cần chọn **cột loại hình lớp** ở thanh bên để xác định ngoại lệ sư phạm.")
     else:
-        glabels = pd_unique(sub[group_col].astype(str).values)
+        glabels = pd_unique(str_values(sub[group_col]))
         means = {g: sub.loc[sub[group_col].astype(str) == g, c].mean() for g in glabels}
         g_low_default = min(means, key=means.get)
         g_high_default = max(means, key=means.get)
@@ -841,7 +855,7 @@ with tab2:
                        f"rồi giảm nhẹ về {gh[-1]:.3f} ở x = {grid[-1]:.1f}.")
 
         p1, p2 = st.columns(2)
-        p1.pyplot(plot_spectrum(res, sub[group_col].astype(str).values, x_hi=xh, x_lo=xl), clear_figure=True)
+        p1.pyplot(plot_spectrum(res, str_values(sub[group_col]), x_hi=xh, x_lo=xl), clear_figure=True)
         p2.pyplot(plot_gamma(res, th_hi, th_lo, xh, xl), clear_figure=True)
 
         show_cols = [x for x in [id_col] if x] + [k for k in sub.columns if k.lower().strip() == "lớp"] + \
@@ -898,7 +912,7 @@ with tab3:
 
             p1, p2 = st.columns([1.2, 1])
             p1.pyplot(plot_progress(prog["ΔZ_q"].to_numpy(),
-                                    prog[group_col].astype(str).values if group_col else None), clear_figure=True)
+                                    str_values(prog[group_col]) if group_col else None), clear_figure=True)
             if group_col:
                 agg = {"ΔZ_q": ["count", "mean", "std"]}
                 if has_zs:
