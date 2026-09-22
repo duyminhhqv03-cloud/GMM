@@ -1,509 +1,457 @@
 """
-SmartZ-EDU — Hệ thống Z-score thích ứng bằng Mô hình Hỗn hợp Gauss Mềm (Soft GMM)
-hỗ trợ đánh giá công bằng và ra quyết định quản lý giáo dục THCS.
+SmartZ-EDU — Chuẩn hoá điểm số khi phổ điểm không thuần nhất
+bằng Mô hình Hỗn hợp Gauss (GMM) và Z-score lượng tử hoá Z_q.
 
-Phương pháp chính: Z-score GMM MỀM (soft/posterior-weighted) — mỗi học sinh được
-gán trọng số xác suất (gamma) thuộc về từng "cụm năng lực", thay vì bị ép buộc
-phân loại cứng vào một nhóm duy nhất.
-
-Cơ chế thích ứng tự động (TỔNG QUÁT): hệ thống tự động dò số đỉnh (số thành phần
-Gauss) từ k=1 đến k=K_MAX, chọn k có BIC nhỏ nhất — không áp đặt sẵn "phải có
-đúng 2 đỉnh", mà để dữ liệu tự quyết định. Trên dữ liệu thực tế của trường (có
-đúng 2 loại hình lớp), thuật toán tự tìm ra k=2 là tối ưu — một bằng chứng khách
-quan củng cố giả thuyết ban đầu, thay vì một giả định được áp đặt trước.
-
-Chạy local:  streamlit run app.py
+Chạy cục bộ:   streamlit run app.py
 """
+from __future__ import annotations
 
 import io
+from pathlib import Path
+
 import numpy as np
 import pandas as pd
 import streamlit as st
-import matplotlib.pyplot as plt
-from scipy import stats
-from sklearn.mixture import GaussianMixture
 
-st.set_page_config(
-    page_title="SmartZ-EDU — Z-score thích ứng bằng Soft GMM",
-    page_icon="🎓",
-    layout="wide",
-    initial_sidebar_state="expanded",
+from core.io import (apply_header, detect_header_row, guess_group_col, guess_id_col,
+                     guess_score_cols, list_sheets, read_raw)
+from core.model import (analyse_column, bootstrap_lrt, describe_by_group, pd_unique,
+                        raftery_label, x_star_high, x_star_low)
+from core.plots import plot_gamma, plot_indices, plot_progress, plot_spectrum
+
+st.set_page_config(page_title="SmartZ-EDU", page_icon="📊", layout="wide")
+
+SAMPLE_PATH = Path(__file__).parent / "data" / "Diem_GK_CK_An_Danh_4Khoi.xlsx"
+ZQ = "Z_q (lượng tử hoá)"
+ZS = "Z* (GMM mềm)"
+
+DISCLAIMER = (
+    "**Khuyến cáo sử dụng.** Kết quả, đặc biệt là danh sách *ngoại lệ sư phạm*, "
+    "**không được và không nên** dùng làm căn cứ duy nhất cho bất kỳ quyết định hành chính nào "
+    "đối với học sinh. Đây là kết quả tính toán trên một môn học, ở một số mốc đánh giá nhất định; "
+    "cần đối chiếu với nhận định của giáo viên chủ nhiệm, giáo viên bộ môn và hoàn cảnh cụ thể của từng em."
 )
 
-K_MAX_DEFAULT = 4  # số đỉnh tối đa mà hệ thống sẽ dò thử
 
-# ----------------------------------------------------------------------
-# GIAO DIỆN: CSS TUỲ CHỈNH
-# ----------------------------------------------------------------------
-st.markdown(
-    """
-    <style>
-    .main > div { padding-top: 1.2rem; }
-
-    .smartz-hero {
-        background: linear-gradient(135deg, #1e3a5f 0%, #2c5f8a 45%, #3a8fb7 100%);
-        border-radius: 18px;
-        padding: 2rem 2.2rem;
-        margin-bottom: 1.4rem;
-        color: white;
-    }
-    .smartz-hero h1 { font-size: 1.9rem; font-weight: 800; margin: 0 0 0.4rem 0; color: white; }
-    .smartz-hero p { font-size: 1rem; opacity: 0.92; margin: 0; max-width: 850px; line-height: 1.5; }
-    .smartz-badge {
-        display: inline-block; background: rgba(255,255,255,0.18);
-        border: 1px solid rgba(255,255,255,0.35); border-radius: 999px;
-        padding: 0.15rem 0.75rem; font-size: 0.78rem; margin-right: 0.4rem; margin-top: 0.7rem;
-    }
-    .smartz-decision-gmm {
-        background: linear-gradient(90deg, #e8f8ee 0%, #d6f2e0 100%);
-        border-left: 5px solid #2e9e5b; border-radius: 10px; padding: 0.85rem 1.1rem; font-size: 0.95rem;
-    }
-    .smartz-decision-naive {
-        background: linear-gradient(90deg, #eaf2fb 0%, #dcebf9 100%);
-        border-left: 5px solid #3a7ec9; border-radius: 10px; padding: 0.85rem 1.1rem; font-size: 0.95rem;
-    }
-    .smartz-decision-multi {
-        background: linear-gradient(90deg, #f5eefc 0%, #ece0f9 100%);
-        border-left: 5px solid #8e5fc9; border-radius: 10px; padding: 0.85rem 1.1rem; font-size: 0.95rem;
-    }
-    .smartz-flag-up {
-        background: #fff4e5; border-left: 5px solid #e6912c; border-radius: 10px;
-        padding: 0.7rem 1rem; margin-bottom: 0.5rem;
-    }
-    .smartz-flag-down {
-        background: #fdeaea; border-left: 5px solid #d9534f; border-radius: 10px;
-        padding: 0.7rem 1rem; margin-bottom: 0.5rem;
-    }
-    div[data-testid="stMetric"] { background: rgba(120,120,120,0.06); border-radius: 12px; padding: 0.7rem 0.9rem; }
-    </style>
-    """,
-    unsafe_allow_html=True,
-)
-
-# ----------------------------------------------------------------------
-# LÕI THUẬT TOÁN (TỔNG QUÁT k THÀNH PHẦN)
-# ----------------------------------------------------------------------
-
-def fit_gmm_k(x: np.ndarray, k: int):
-    """Fit GMM k thành phần, sắp xếp các thành phần theo trung bình tăng dần."""
-    gmm = GaussianMixture(n_components=k, n_init=20, random_state=42).fit(x.reshape(-1, 1))
-    means = gmm.means_.flatten()
-    stds = np.sqrt(gmm.covariances_).flatten()
-    weights = gmm.weights_.flatten()
-    order = np.argsort(means)
-    components = [(means[i], stds[i], weights[i]) for i in order]
-    return components, gmm.bic(x.reshape(-1, 1))
+# ---------------------------------------------------------------------------
+# Cache
+# ---------------------------------------------------------------------------
+@st.cache_data(show_spinner=False)
+def load_raw(file_bytes: bytes, filename: str, sheet: str | None):
+    return read_raw(file_bytes, filename, sheet)
 
 
-def adaptive_search(x: np.ndarray, k_max: int = K_MAX_DEFAULT):
-    """Tự động dò số đỉnh (thành phần Gauss) từ k=1 đến k_max, chọn k có BIC nhỏ nhất.
-    Trả về (best_k, components_tại_best_k, bang_bic {k: bic})."""
-    n = len(x)
-    k_max_eff = max(1, min(k_max, n // 5))  # tránh overfit khi mẫu nhỏ (tối thiểu ~5 điểm/thành phần)
-    bic_table, comps_by_k = {}, {}
-    for k in range(1, k_max_eff + 1):
-        comps, bic = fit_gmm_k(x, k)
-        bic_table[k] = bic
-        comps_by_k[k] = comps
-    best_k = min(bic_table, key=bic_table.get)
-    return best_k, comps_by_k[best_k], bic_table
+@st.cache_data(show_spinner=False)
+def get_sheets(file_bytes: bytes, filename: str):
+    return list_sheets(file_bytes, filename)
 
 
-def z_naive(x: np.ndarray) -> np.ndarray:
-    return (x - x.mean()) / x.std(ddof=1)
+@st.cache_data(show_spinner=False)
+def run_analysis(name: str, x: np.ndarray, groups, k_override):
+    return analyse_column(name, x, groups, k_override=k_override)
 
 
-def z_soft_gmm_k(x: np.ndarray, components):
-    """Z-score GMM MỀM tổng quát cho k thành phần bất kỳ: Z* = Σ_k γ_k · z_k,
-    với γ_k là xác suất hậu nghiệm (posterior) theo định lý Bayes."""
-    dens = np.zeros((len(components), len(x)))
-    for i, (mu, s, pi) in enumerate(components):
-        dens[i] = pi * stats.norm.pdf(x, mu, s)
-    denom = dens.sum(axis=0)
-    denom = np.where(denom <= 0, 1e-300, denom)
-    gammas = dens / denom  # shape (k, n)
-    z_each = np.array([(x - mu) / s for (mu, s, _) in components])  # shape (k, n)
-    z_soft = (gammas * z_each).sum(axis=0)
-    return z_soft, gammas
+def fmt(v, nd=2):
+    if v is None or (isinstance(v, float) and np.isnan(v)):
+        return "—"
+    return f"{v:.{nd}f}"
 
 
-def z_hard_gmm_k(x: np.ndarray, components, gammas):
-    best_comp = np.argmax(gammas, axis=0)
-    z_each = np.array([(x - mu) / s for (mu, s, _) in components])
-    return z_each[best_comp, np.arange(len(x))]
-
-
-def analyze_column(raw: pd.DataFrame, group_col: str, score_col: str, k_max: int):
-    """Xử lý một cột điểm: làm sạch dữ liệu, tự động dò số đỉnh, tính các loại Z-score.
-    Giữ nguyên chỉ số (index) gốc của `raw` để ghép nối chính xác giữa nhiều cột điểm."""
-    data = raw[[group_col, score_col]].copy()
-    data[score_col] = pd.to_numeric(data[score_col], errors="coerce")
-    data = data.dropna()  # giữ nguyên index gốc, KHÔNG reset_index
-    if data.empty:
-        return None
-
-    x = data[score_col].values
-    best_k, components, bic_table = adaptive_search(x, k_max=k_max)
-
-    result = data.copy()
-    result["Z_truyen_thong"] = z_naive(x).round(3)
-
-    gammas = None
-    if best_k >= 2:
-        z_s, gammas = z_soft_gmm_k(x, components)
-        z_h = z_hard_gmm_k(x, components, gammas)
-        for i in range(best_k):
-            result[f"gamma_cum_{i+1}"] = gammas[i].round(4)
-        result["Z_GMM_mem"] = z_s.round(3)
-        result["Z_GMM_cung"] = z_h.round(3)
-
-    return {
-        "score_col": score_col, "data": data, "x": x,
-        "best_k": best_k, "components": components, "bic_table": bic_table,
-        "gammas": gammas, "result": result,
-    }
-
-
-def render_distribution_chart(score_col: str, x: np.ndarray, components, best_k: int):
-    fig, ax = plt.subplots(figsize=(9, 4.6))
-    lo, hi = float(np.floor(x.min())), float(np.ceil(x.max()))
-    bins = np.arange(max(0, lo - 0.5), hi + 1.0, 0.5)
-    ax.hist(x, bins=bins, density=True, color="#8ecae6", edgecolor="white", alpha=0.85,
-            label="Phổ điểm thực tế")
-    xs = np.linspace(bins[0], bins[-1], 400)
-    palette = ["#e76f51", "#2a9d8f", "#e9c46a", "#8e5fc9"]
-    if best_k >= 2:
-        total = np.zeros_like(xs)
-        for i, (mu, s, pi) in enumerate(components):
-            comp_curve = pi * stats.norm.pdf(xs, mu, s)
-            total += comp_curve
-            ax.plot(xs, comp_curve, color=palette[i % len(palette)], ls="--", lw=2,
-                    label=f"Cụm {i+1} (μ≈{mu:.1f}, tỉ trọng {pi:.2f})")
-        ax.plot(xs, total, color="#1d3557", lw=2.4, label=f"Tổng hợp GMM {best_k} đỉnh")
-    else:
-        mu, sd = x.mean(), x.std()
-        ax.plot(xs, stats.norm.pdf(xs, mu, sd), color="#1d3557", lw=2.4,
-                label=f"Phân phối chuẩn (μ≈{mu:.1f})")
-    ax.set_title(f"Phổ điểm {score_col} — bước nhảy 0.5 điểm", fontsize=12, fontweight="bold")
-    ax.set_xlabel("Điểm số"); ax.set_ylabel("Mật độ xác suất")
-    ax.set_xticks(np.arange(bins[0], bins[-1] + 0.5, 0.5))
-    ax.tick_params(axis="x", rotation=45)
-    ax.legend(fontsize=8, frameon=False)
-    ax.grid(True, ls="--", alpha=0.35)
-    ax.spines[["top", "right"]].set_visible(False)
-    plt.tight_layout()
-    return fig
-
-
-def render_bic_chart(bic_table: dict, best_k: int):
-    fig, ax = plt.subplots(figsize=(5, 3.2))
-    ks = sorted(bic_table.keys())
-    vals = [bic_table[k] for k in ks]
-    colors = ["#2e9e5b" if k == best_k else "#a8b3bd" for k in ks]
-    ax.bar([str(k) for k in ks], vals, color=colors)
-    ax.set_xlabel("Số đỉnh giả định (k)"); ax.set_ylabel("BIC (càng thấp càng tốt)")
-    ax.set_title("So sánh BIC theo số đỉnh", fontsize=10, fontweight="bold")
-    for i, v in enumerate(vals):
-        ax.text(i, v, f"{v:.0f}", ha="center", va="bottom", fontsize=8)
-    ax.spines[["top", "right"]].set_visible(False)
-    plt.tight_layout()
-    return fig
-
-
-def render_analysis(raw: pd.DataFrame, group_col: str, r: dict, exception_threshold: float):
-    """Hiển thị toàn bộ kết quả phân tích cho MỘT cột điểm (dùng chung cho cả 2 chế độ)."""
-    score_col, x, result = r["score_col"], r["x"], r["result"]
-    best_k = r["best_k"]
-
-    m1, m2, m3 = st.columns(3)
-    m1.metric("Số học sinh hợp lệ", f"{len(x)}")
-    m2.metric("Số đỉnh tự động phát hiện (k)", f"{best_k}")
-    m3.metric("BIC tại k tối ưu", f"{r['bic_table'][best_k]:.1f}")
-
-    if best_k == 1:
-        st.markdown(
-            '<div class="smartz-decision-naive">ℹ️ &nbsp;Hệ thống dò k = 1..%d và xác định '
-            '<b>phổ điểm chỉ có 1 đỉnh</b> (đơn phương thức) → tự động dùng '
-            '<b>Z-score truyền thống</b>.</div>' % max(r["bic_table"].keys()),
-            unsafe_allow_html=True,
-        )
-    elif best_k == 2:
-        st.markdown(
-            '<div class="smartz-decision-gmm">✅ &nbsp;Hệ thống tự động dò và xác định '
-            '<b>phổ điểm có 2 đỉnh</b> là mô tả tối ưu (BIC nhỏ nhất) → áp dụng '
-            '<b>Z-score GMM Mềm với 2 cụm</b>.</div>',
-            unsafe_allow_html=True,
-        )
-    else:
-        st.markdown(
-            f'<div class="smartz-decision-multi">🔎 &nbsp;Hệ thống tự động dò và xác định '
-            f'<b>phổ điểm có {best_k} đỉnh</b> là mô tả tối ưu → áp dụng <b>Z-score GMM Mềm '
-            f'với {best_k} cụm</b>. Lưu ý: với trên 2 cụm, hệ thống chưa tự ánh xạ từng cụm '
-            f'sang đúng một loại hình lớp hành chính cụ thể.</div>',
-            unsafe_allow_html=True,
-        )
-
-    st.write("")
-    tab_names = ["📈 Biểu đồ phổ điểm", "🔬 Cơ chế thích ứng (BIC)", "🗂️ Bảng kết quả"]
-    if best_k == 2:
-        tab_names.insert(2, "🚩 Ngoại lệ sư phạm")
-    elif best_k > 2:
-        tab_names.insert(2, "🧩 Xác suất theo cụm")
-    tabs = st.tabs(tab_names)
-
-    with tabs[0]:
-        fig = render_distribution_chart(score_col, x, r["components"], best_k)
-        st.pyplot(fig, use_container_width=True)
-
-    with tabs[1]:
-        cL, cR = st.columns([1, 1])
-        with cL:
-            fig_bic = render_bic_chart(r["bic_table"], best_k)
-            st.pyplot(fig_bic, use_container_width=True)
-        with cR:
-            bic_df = pd.DataFrame(
-                {"Số đỉnh (k)": list(r["bic_table"].keys()), "BIC": list(r["bic_table"].values())}
-            )
-            bic_df["Được chọn"] = bic_df["Số đỉnh (k)"].apply(lambda k: "✅" if k == best_k else "")
-            st.dataframe(bic_df, use_container_width=True, hide_index=True)
-            st.caption(
-                "Hệ thống dò từ k=1 đến k tối đa, KHÔNG áp đặt sẵn số đỉnh — "
-                "k được chọn là giá trị cho BIC nhỏ nhất."
-            )
-
-    idx_extra = 2
-    if best_k == 2:
-        with tabs[idx_extra]:
-            st.caption(
-                f"Học sinh được gắn cờ khi xác suất γ thuộc **cụm khác với nhóm hành chính hiện "
-                f"tại** vượt ngưỡng **{exception_threshold:.2f}** — gợi ý tham mưu chuyển lớp / phụ đạo."
-            )
-            groups = result[group_col].unique().tolist()
-            if len(groups) == 2:
-                means_by_group = result.groupby(group_col)[score_col].mean()
-                low_group, high_group = means_by_group.idxmin(), means_by_group.idxmax()
-                exc_up = result[(result[group_col] == low_group) & (result["gamma_cum_2"] > exception_threshold)]
-                exc_down = result[(result[group_col] == high_group) & (result["gamma_cum_2"] < 1 - exception_threshold)]
-
-                cA, cB = st.columns(2)
-                with cA:
-                    st.markdown(
-                        f'<div class="smartz-flag-up">🔺 <b>{len(exc_up)} học sinh</b> thuộc '
-                        f'<i>{low_group}</i> có năng lực gần với cụm điểm cao (γ &gt; '
-                        f'{exception_threshold:.2f}) — cân nhắc bồi dưỡng / đề xuất chuyển lớp.</div>',
-                        unsafe_allow_html=True,
-                    )
-                    st.dataframe(exc_up, use_container_width=True, height=220)
-                with cB:
-                    st.markdown(
-                        f'<div class="smartz-flag-down">🔻 <b>{len(exc_down)} học sinh</b> thuộc '
-                        f'<i>{high_group}</i> có năng lực gần với cụm điểm thấp (γ &lt; '
-                        f'{1 - exception_threshold:.2f}) — cân nhắc phụ đạo thêm.</div>',
-                        unsafe_allow_html=True,
-                    )
-                    st.dataframe(exc_down, use_container_width=True, height=220)
-            else:
-                st.info("Cần đúng 2 nhóm trong cột loại hình lớp để phát hiện ngoại lệ sư phạm.")
-        idx_extra += 1
-    elif best_k > 2:
-        with tabs[idx_extra]:
-            st.caption(
-                f"Phổ điểm được mô tả tốt nhất bởi {best_k} cụm năng lực. Bảng dưới đây cho thấy "
-                f"xác suất (γ) mỗi học sinh thuộc về từng cụm — dùng để phân tích chi tiết thêm."
-            )
-            gamma_cols = [c for c in result.columns if c.startswith("gamma_cum_")]
-            st.dataframe(result[[group_col, score_col] + gamma_cols], use_container_width=True)
-        idx_extra += 1
-
-    with tabs[idx_extra]:
-        st.dataframe(result, use_container_width=True)
-        buf = io.BytesIO()
-        with pd.ExcelWriter(buf, engine="openpyxl") as writer:
-            result.to_excel(writer, index=False, sheet_name="KetQua")
-        st.download_button(
-            f"⬇️ Tải kết quả ({score_col}) — Excel", data=buf.getvalue(),
-            file_name=f"ketqua_{score_col}.xlsx",
-            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-            key=f"dl_{score_col}",
-        )
-
-
-def render_progress_comparison(raw: pd.DataFrame, group_col: str, results_by_col: dict, col_from: str, col_to: str):
-    """So sánh tiến bộ Z-score GMM Mềm giữa 2 cột điểm, ghép đúng theo học sinh (index gốc)."""
-    r_from, r_to = results_by_col[col_from], results_by_col[col_to]
-    if not (r_from["best_k"] >= 2 and r_to["best_k"] >= 2):
-        st.info(
-            "Chỉ có thể so sánh tiến bộ khi CẢ HAI cột điểm đều được xác định có từ 2 đỉnh trở lên "
-            "(cột có 1 đỉnh dùng Z-score truyền thống, chưa có Z* để so sánh)."
-        )
-        return
-
-    merged = pd.concat(
-        [raw[[group_col]], r_from["result"]["Z_GMM_mem"].rename(f"Z_GMM_mem_{col_from}"),
-         r_to["result"]["Z_GMM_mem"].rename(f"Z_GMM_mem_{col_to}")],
-        axis=1, join="inner",
-    ).dropna()
-    merged["Tien_bo"] = merged[f"Z_GMM_mem_{col_to}"] - merged[f"Z_GMM_mem_{col_from}"]
-
-    st.markdown(
-        f"Chênh lệch Z-score GMM Mềm từ **{col_from}** sang **{col_to}** — dương nghĩa là tiến bộ, "
-        f"âm là sa sút, theo đúng nhóm năng lực tham chiếu của từng học sinh "
-        f"(đã ghép đúng theo từng học sinh, n = {len(merged)})."
-    )
-    summary = merged.groupby(group_col)["Tien_bo"].agg(["mean", "std", "count"]).round(3)
-    summary.columns = ["Tiến bộ TB", "Độ lệch chuẩn", "Số học sinh"]
-    st.dataframe(summary, use_container_width=True)
-    st.dataframe(merged, use_container_width=True)
-
-
-# ----------------------------------------------------------------------
-# GIAO DIỆN CHÍNH
-# ----------------------------------------------------------------------
-
-st.markdown(
-    """
-    <div class="smartz-hero">
-        <h1>🎓 SmartZ-EDU</h1>
-        <p>Hệ thống Z-score thích ứng bằng Mô hình Hỗn hợp Gauss Mềm (Soft GMM) —
-        tự động dò số đỉnh của phổ điểm (không áp đặt sẵn) để hỗ trợ đánh giá công bằng
-        và ra quyết định quản lý giáo dục.</p>
-        <span class="smartz-badge">🧠 Soft GMM</span>
-        <span class="smartz-badge">🔄 Tự động dò số đỉnh (k=1..4)</span>
-        <span class="smartz-badge">🚩 Phát hiện ngoại lệ sư phạm</span>
-        <span class="smartz-badge">📈 Theo dõi tiến bộ</span>
-    </div>
-    """,
-    unsafe_allow_html=True,
-)
-
-with st.expander("ℹ️ Về phương pháp Soft GMM và cơ chế thích ứng tự động"):
-    st.markdown(
-        """
-- **Z-score GMM Mềm (phương pháp chính):** mỗi học sinh được gán trọng số xác suất
-  γ (gamma) thuộc về từng cụm năng lực, thay vì bị ép buộc phân loại cứng.
-- **Cơ chế thích ứng tự động (tổng quát):** hệ thống dò lần lượt mô hình với
-  k = 1, 2, 3, 4 thành phần Gauss, so sánh bằng tiêu chuẩn BIC, và chọn k có BIC
-  nhỏ nhất — **không áp đặt sẵn phải có đúng 2 đỉnh**. Nếu dữ liệu chỉ có 1 đỉnh,
-  hệ thống tự quay về Z-score truyền thống; nếu có nhiều hơn 2 đỉnh, hệ thống vẫn
-  tính được Z-score mềm tổng quát cho từng cụm.
-        """
-    )
-
+# ---------------------------------------------------------------------------
+# Thanh bên: nhập dữ liệu
+# ---------------------------------------------------------------------------
 with st.sidebar:
-    st.markdown("### 📂 1. Tải dữ liệu")
-    uploaded = st.file_uploader("Chọn file Excel/CSV điểm số", type=["xlsx", "xls", "csv"])
-    st.caption(
-        "File cần có tối thiểu 2 cột: **loại hình lớp** (vd Lớp TC / Lớp hai buổi) và "
-        "**điểm số**. Có thể có nhiều cột điểm (Giữa kỳ, Cuối kỳ...)."
-    )
-    st.markdown("---")
-    st.markdown("### ⚙️ 2. Tuỳ chọn phân tích")
-    k_max = st.slider(
-        "Số đỉnh tối đa để dò thử (k_max)", 2, 6, K_MAX_DEFAULT, 1,
-        help="Hệ thống sẽ tự động dò từ k=1 đến giá trị này và chọn k tối ưu theo BIC.",
-    )
-    exception_threshold = st.slider(
-        "Ngưỡng γ — 'ngoại lệ sư phạm' (áp dụng khi k=2)", 0.5, 0.9, 0.7, 0.05,
-        help="Học sinh có xác suất γ thuộc cụm khác vượt ngưỡng này sẽ được gắn cờ.",
-    )
+    st.markdown("## 📊 SmartZ-EDU")
+    st.caption("Chuẩn hoá điểm số bằng GMM thích ứng và Z-score lượng tử hoá")
 
-if uploaded is None:
-    st.info("👈 Hãy tải lên file dữ liệu điểm số ở thanh bên trái để bắt đầu.")
-    st.stop()
-
-# --- Đọc file, tự nhận diện dòng tiêu đề ---
-try:
-    if uploaded.name.endswith(".csv"):
-        raw_no_header = pd.read_csv(uploaded, header=None)
+    source = st.radio("Nguồn dữ liệu", ["Tải file lên", "Dùng dữ liệu mẫu"], horizontal=True)
+    file_bytes, filename = None, None
+    if source == "Tải file lên":
+        up = st.file_uploader("File điểm (Excel hoặc CSV)", type=["xlsx", "xls", "csv"])
+        if up is not None:
+            file_bytes, filename = up.getvalue(), up.name
+    elif SAMPLE_PATH.exists():
+        file_bytes, filename = SAMPLE_PATH.read_bytes(), SAMPLE_PATH.name
+        st.caption("Dữ liệu mẫu: điểm Toán ẩn danh 4 khối, 2 học kỳ.")
     else:
-        raw_no_header = pd.read_excel(uploaded, header=None)
-except Exception as e:
-    st.error(f"Không đọc được file: {e}")
+        st.warning("Không tìm thấy file dữ liệu mẫu trong thư mục `data/`.")
+
+    df = None
+    if file_bytes is not None:
+        sheets = get_sheets(file_bytes, filename)
+        default_sheet = sheets.index("K9_HK2") if "K9_HK2" in sheets else 0
+        sheet = st.selectbox("Trang tính", sheets, index=default_sheet) if len(sheets) > 1 else sheets[0]
+        raw = load_raw(file_bytes, filename, None if sheet == "(CSV)" else sheet)
+        auto_h = detect_header_row(raw)
+        h = st.number_input("Dòng tiêu đề (tự nhận diện)", min_value=1, max_value=max(1, len(raw)),
+                            value=auto_h + 1, step=1,
+                            help="Hệ thống tự tìm dòng chứa tên cột. Sửa lại nếu nhận diện sai.")
+        df = apply_header(raw, int(h) - 1)
+
+        cols = list(df.columns)
+        g_guess = guess_group_col(df)
+        group_col = st.selectbox("Cột loại hình lớp", ["(Không có)"] + cols,
+                                 index=(cols.index(g_guess) + 1) if g_guess in cols else 0)
+        group_col = None if group_col == "(Không có)" else group_col
+
+        s_guess = [c for c in guess_score_cols(df) if c != group_col]
+        score_cols = st.multiselect("Cột điểm cần phân tích", cols, default=s_guess)
+
+        id_guess = guess_id_col(df)
+        id_col = st.selectbox("Cột mã học sinh (để hiển thị)", ["(Không có)"] + cols,
+                              index=(cols.index(id_guess) + 1) if id_guess in cols else 0)
+        id_col = None if id_col == "(Không có)" else id_col
+
+        with st.expander("Tuỳ chọn nâng cao"):
+            k_mode = st.selectbox("Số thành phần k", ["Tự động (BIC)", "1", "2", "3", "4"],
+                                  help="Mặc định để dữ liệu tự quyết định bằng BIC.")
+            k_override = None if k_mode.startswith("Tự động") else int(k_mode)
+            st.caption("Cấu hình tái lập: random_state = 42, n_init = 20, covariance_type = 'full'.")
+    st.divider()
+    st.caption("Dự án nghiên cứu khoa học kỹ thuật — dữ liệu được xử lý trong phiên làm việc, "
+               "không lưu trữ trên máy chủ.")
+
+
+# ---------------------------------------------------------------------------
+# Trang chào
+# ---------------------------------------------------------------------------
+st.title("SmartZ-EDU")
+st.markdown("##### Chuẩn hoá điểm số khi phổ điểm không thuần nhất — GMM thích ứng & Z-score lượng tử hoá")
+
+if df is None:
+    st.info("👈 Tải file điểm lên ở thanh bên, hoặc chọn **Dùng dữ liệu mẫu** để xem thử.")
+    c1, c2, c3 = st.columns(3)
+    c1.markdown("**1. Tải dữ liệu**\n\nFile Excel/CSV, mỗi dòng một học sinh; có cột loại hình lớp "
+                "và một hoặc nhiều cột điểm (thang 0–10).")
+    c2.markdown("**2. Hệ thống tự phân tích**\n\nChọn số thành phần bằng BIC, kiểm tra tính đơn điệu "
+                "của Z*, tự chuyển sang Z_q an toàn.")
+    c3.markdown("**3. Đọc kết quả**\n\nPhổ điểm, ngoại lệ sư phạm kèm ngưỡng điểm x*, tiến bộ ΔZ_q, "
+                "tải kết quả về Excel.")
     st.stop()
-
-preview_rows = min(10, len(raw_no_header))
-non_null_counts = raw_no_header.head(preview_rows).notna().sum(axis=1)
-guess_header_row = int(non_null_counts.idxmax())
-
-with st.expander("📄 3. Xem trước dữ liệu thô & chọn dòng tiêu đề", expanded=False):
-    st.dataframe(raw_no_header.head(preview_rows), use_container_width=True)
-    header_row = st.number_input(
-        "Dòng nào là DÒNG TIÊU ĐỀ? (đánh số từ 0)",
-        min_value=0, max_value=preview_rows - 1, value=guess_header_row, step=1,
-    )
-
-raw = raw_no_header.iloc[header_row + 1:].copy()
-raw.columns = raw_no_header.iloc[header_row].values
-raw = raw.dropna(axis=1, how="all")
-raw = raw.loc[:, [c for c in raw.columns if pd.notna(c)]]
-raw.index = range(len(raw))  # chỉ số gốc dùng để ghép nối chính xác giữa các cột điểm
-
-cols = raw.columns.tolist()
-st.markdown("### 🎯 4. Chọn cột dữ liệu & chế độ phân tích")
-
-c_group, c_mode = st.columns([1, 1])
-with c_group:
-    group_col = st.selectbox("Cột chứa LOẠI HÌNH LỚP", cols, index=0)
-with c_mode:
-    mode = st.radio(
-        "Chế độ phân tích", ["🔎 Một cột điểm", "🧮 Nhiều cột điểm (so sánh)"],
-        horizontal=True,
-    )
-
-available_score_cols = [c for c in cols if c != group_col]
-
-if mode == "🔎 Một cột điểm":
-    score_cols = [st.selectbox("Chọn cột ĐIỂM SỐ cần phân tích", available_score_cols)]
-else:
-    score_cols = st.multiselect(
-        "Chọn các cột ĐIỂM SỐ cần phân tích (vd Giữa kỳ và Cuối kỳ để so sánh tiến bộ)",
-        available_score_cols, default=available_score_cols[:2],
-    )
 
 if not score_cols:
-    st.warning("Vui lòng chọn ít nhất một cột điểm số.")
+    st.warning("Hãy chọn ít nhất một cột điểm ở thanh bên.")
     st.stop()
 
-st.markdown("---")
+# ---------------------------------------------------------------------------
+# Phân tích từng cột điểm
+# ---------------------------------------------------------------------------
+results, subsets = {}, {}
+with st.spinner("Đang ước lượng mô hình hỗn hợp Gauss…"):
+    for c in score_cols:
+        if not pd.api.types.is_numeric_dtype(df[c]):
+            st.error(f"Cột **{c}** không phải cột số.")
+            st.stop()
+        mask = df[c].notna()
+        if group_col:
+            mask &= df[group_col].notna()
+        sub = df.loc[mask].copy()
+        if len(sub) < 20:
+            st.error(f"Cột **{c}** chỉ có {len(sub)} giá trị hợp lệ — cần tối thiểu 20.")
+            st.stop()
+        groups = sub[group_col].astype(str).values if group_col else None
+        res = run_analysis(c, sub[c].to_numpy(dtype=float), groups, k_override)
+        for name, vals in res.scores.items():
+            sub[name] = vals
+        results[c], subsets[c] = res, sub
 
-# --- Phân tích từng cột đã chọn ---
-results_by_col = {}
-for score_col in score_cols:
-    r = analyze_column(raw, group_col, score_col, k_max=k_max)
-    if r is None:
-        st.warning(f"Không có dữ liệu hợp lệ cho cột `{score_col}`.")
-        continue
-    results_by_col[score_col] = r
+tab1, tab2, tab3, tab4, tab5 = st.tabs(
+    ["📊 Phân tích & phổ điểm", "🎯 Ngoại lệ sư phạm", "📈 Tiến bộ", "📥 Kết quả & tải về", "📘 Phương pháp"])
 
-if not results_by_col:
-    st.stop()
+# ---------------------------------------------------------------------------
+# Tab 1: Phân tích
+# ---------------------------------------------------------------------------
+with tab1:
+    col_tabs = st.tabs(score_cols) if len(score_cols) > 1 else [st.container()]
+    for c, ct in zip(score_cols, col_tabs):
+        res, sub = results[c], subsets[c]
+        groups = sub[group_col].astype(str).values if group_col else None
+        with ct:
+            sel = res.selection
+            d12 = sel["delta_1_to_2"]
+            m1, m2, m3, m4 = st.columns(4)
+            m1.metric("Số học sinh", len(res.x))
+            m2.metric("Số thành phần k", res.k,
+                      help="Chọn tự động theo BIC nhỏ nhất" if k_override is None else "Do người dùng cố định")
+            m3.metric("ΔBIC (k=1 → k=2)", fmt(d12), raftery_label(d12) if not np.isnan(d12) else None,
+                      delta_color="off")
+            m4.metric("Số đỉnh của phổ điểm", res.n_modes,
+                      help="Số cực đại của mật độ hỗn hợp đã ước lượng")
 
-if len(results_by_col) == 1:
-    only_col = list(results_by_col.keys())[0]
-    st.markdown(f"## 📊 Kết quả phân tích: `{only_col}`")
-    render_analysis(raw, group_col, results_by_col[only_col], exception_threshold)
-else:
-    tab_labels = [f"📊 {c}" for c in results_by_col] + ["📈 So sánh tiến bộ"]
-    outer_tabs = st.tabs(tab_labels)
-    for tab, score_col in zip(outer_tabs[:-1], results_by_col):
-        with tab:
-            render_analysis(raw, group_col, results_by_col[score_col], exception_threshold)
-    with outer_tabs[-1]:
-        keys = list(results_by_col.keys())
-        cA, cB = st.columns(2)
-        with cA:
-            col_from = st.selectbox("Từ cột", keys, index=0)
-        with cB:
-            col_to = st.selectbox("Sang cột", keys, index=min(1, len(keys) - 1))
-        if col_from == col_to:
-            st.info("Hãy chọn hai cột điểm khác nhau để so sánh tiến bộ.")
+            # --- Cảnh báo đơn điệu ---
+            if res.k == 1:
+                st.info("Cơ chế thích ứng chọn **k = 1**: phổ điểm được mô tả tốt bởi một phân phối chuẩn. "
+                        "Hệ thống dùng **Z-score truyền thống** (khi k = 1, Z_q trùng Z).")
+            elif not res.mono["monotone"]:
+                iv = "; ".join(f"[{a:.2f}; {b:.2f}]" for a, b in res.mono["intervals"])
+                st.error(f"⚠️ **Phát hiện vùng không đơn điệu của Z\\***: trên khoảng điểm {iv}, "
+                         "học sinh có điểm cao hơn lại nhận Z\\* thấp hơn. "
+                         "Hệ thống **đã tự động chuyển sang Z_q** làm chỉ số chính thức.")
+            else:
+                st.success("✅ Z\\* đơn điệu trên toàn thang điểm của dữ liệu này. "
+                           "Chỉ số chính thức vẫn là **Z_q** (đơn điệu nghiêm ngặt với mọi tham số — Định lý 2).")
+            th = res.mono["theorem"] if res.mono else None
+            if th:
+                st.caption(f"Đối chiếu Định lý 1 (k = 2): Δ = {th['delta']:.2f}, σ gộp = {th['sigma_pool']:.2f}, "
+                           f"Δ/σ = {th['ratio']:.2f} → dự báo "
+                           f"{'đơn điệu' if th['predict_monotone'] else 'không đơn điệu'} (ngưỡng Δ/σ = 2).")
+
+            left, right = st.columns([1.35, 1])
+            with left:
+                st.pyplot(plot_spectrum(res, groups), clear_figure=True)
+                st.pyplot(plot_indices(res), clear_figure=True)
+            with right:
+                st.markdown("**Cơ chế thích ứng tự động (BIC)**")
+                best = min(sel["bics"].values())
+                bic_df = pd.DataFrame({
+                    "k": list(sel["bics"].keys()),
+                    "BIC": list(sel["bics"].values()),
+                })
+                bic_df["ΔBIC so với tốt nhất"] = bic_df["BIC"] - best
+                bic_df["Mức bằng chứng (Raftery)"] = [
+                    "✔ Được chọn" if d == 0 else raftery_label(d) for d in bic_df["ΔBIC so với tốt nhất"]]
+                st.dataframe(bic_df.style.format({"BIC": "{:.2f}", "ΔBIC so với tốt nhất": "{:.2f}"}),
+                             hide_index=True, width="stretch")
+                st.caption("Thang Raftery: 0–2 không phân biệt được · 2–6 yếu · 6–10 mạnh · >10 rất mạnh.")
+
+                st.markdown("**Tham số mô hình hỗn hợp**")
+                st.dataframe(pd.DataFrame({
+                    "Thành phần": [f"{j + 1}" for j in range(res.k)],
+                    "Tỉ trọng π": res.mix.weights, "Trung bình μ": res.mix.means, "Độ lệch chuẩn σ": res.mix.sds,
+                }).style.format({"Tỉ trọng π": "{:.3f}", "Trung bình μ": "{:.2f}", "Độ lệch chuẩn σ": "{:.2f}"}),
+                    hide_index=True, width="stretch")
+
+                st.markdown("**Kiểm định tỉ số hợp lý – bootstrap tham số (k=1 so với k=2)**")
+                key = f"lrt::{filename}::{c}::{len(res.x)}::{float(res.x.sum()):.4f}"
+                bcol1, bcol2 = st.columns([1, 1])
+                B = bcol1.selectbox("Số mẫu bootstrap B", [199, 500, 999], index=1, key=f"B_{c}")
+                if bcol2.button("Chạy kiểm định", key=f"run_{c}", width="stretch"):
+                    bar = st.progress(0.0, text="Đang tạo mẫu bootstrap…")
+                    st.session_state[key] = bootstrap_lrt(res.x, B=B, progress=lambda p: bar.progress(p))
+                    bar.empty()
+                if key in st.session_state:
+                    r = st.session_state[key]
+                    p_txt = f"< {1 / (r['B'] + 1):.3f}" if r["p_value"] <= 1 / (r["B"] + 1) + 1e-12 else f"{r['p_value']:.3f}"
+                    st.dataframe(pd.DataFrame([{
+                        "LRT quan sát": r["lrt_obs"], "Ngưỡng 95%": r["crit95"],
+                        f"p (B = {r['B']})": p_txt,
+                        "Kết luận": "Bác bỏ mô hình 1 thành phần" if r["p_value"] < 0.05 else "Chưa bác bỏ",
+                    }]).style.format({"LRT quan sát": "{:.2f}", "Ngưỡng 95%": "{:.2f}"}),
+                        hide_index=True, width="stretch")
+                    st.caption("Kiểm định chỉ khẳng định phổ điểm không phải một Gauss đơn; "
+                               "nó không chứng minh phổ điểm có hai đỉnh.")
+                else:
+                    st.caption("Bấm *Chạy kiểm định* (B = 500 mất khoảng 10 giây).")
+
+                st.markdown("**Thống kê mô tả**")
+                st.dataframe(pd.DataFrame(describe_by_group(res.x, groups)).style.format(
+                    {"Trung bình": "{:.2f}", "Độ lệch chuẩn": "{:.2f}", "Trung vị": "{:.2f}",
+                     "Độ lệch (skew)": "{:.2f}", "Shapiro–Wilk p": "{:.4f}"}),
+                    hide_index=True, width="stretch")
+    st.caption(DISCLAIMER)
+
+# ---------------------------------------------------------------------------
+# Tab 2: Ngoại lệ sư phạm
+# ---------------------------------------------------------------------------
+outlier_tables = {}
+with tab2:
+    c = st.selectbox("Cột điểm", score_cols, key="out_col")
+    res, sub = results[c], subsets[c]
+    if res.k < 2:
+        st.warning("Cột điểm này có k = 1 (không có cấu trúc hỗn hợp) nên không xác định được cụm điểm cao/thấp.")
+    elif not group_col:
+        st.warning("Cần chọn **cột loại hình lớp** ở thanh bên để xác định ngoại lệ sư phạm.")
+    else:
+        glabels = pd_unique(sub[group_col].astype(str).values)
+        means = {g: sub.loc[sub[group_col].astype(str) == g, c].mean() for g in glabels}
+        g_low_default = min(means, key=means.get)
+        g_high_default = max(means, key=means.get)
+        a, b = st.columns(2)
+        g_low = a.selectbox("Nhóm có mặt bằng thấp hơn (vd. Lớp hai buổi)", glabels,
+                            index=glabels.index(g_low_default))
+        g_high = b.selectbox("Nhóm có mặt bằng cao hơn (vd. Lớp TC)", glabels,
+                             index=glabels.index(g_high_default))
+        th_hi = a.slider("Ngưỡng γ_cao cho nhóm thấp (γ_cao >)", 0.50, 0.95, 0.70, 0.05)
+        th_lo = b.slider("Ngưỡng γ_cao cho nhóm cao (γ_cao <)", 0.05, 0.50, 0.30, 0.05)
+
+        xh = x_star_high(res.mix, th_hi, res.lo, res.hi)
+        xl = x_star_low(res.mix, th_lo, res.lo, res.hi)
+        gcol = sub[group_col].astype(str)
+        up = sub[(gcol == g_low) & (sub["γ_cao"] > th_hi)].sort_values(c, ascending=False)
+        down = sub[(gcol == g_high) & (sub["γ_cao"] < th_lo)].sort_values(c)
+        outlier_tables[c] = (up, down)
+
+        m1, m2, m3, m4 = st.columns(4)
+        m1.metric(f"{g_low} thuộc cụm điểm cao", len(up))
+        m2.metric("Ngưỡng điểm x* (cụm cao)", fmt(xh))
+        m3.metric(f"{g_high} thuộc cụm điểm thấp", len(down))
+        m4.metric("Ngưỡng điểm x* (cụm thấp)", fmt(xl))
+        if xh is not None and xl is not None:
+            st.info(f"Diễn đạt tương đương: **{len(up)} học sinh {g_low}** đạt từ **{xh:.2f} điểm** trở lên — "
+                    f"mức điểm mà theo cấu trúc phổ điểm của khối, đặc trưng cho cụm điểm cao; "
+                    f"**{len(down)} học sinh {g_high}** có điểm từ **{xl:.2f}** trở xuống — đặc trưng cho cụm điểm thấp. "
+                    "Ngưỡng x* do dữ liệu tự xác định.")
+
+        grid = np.linspace(res.lo, res.hi, 1001)
+        gh = res.mix.gamma_high(grid)
+        if np.any(np.diff(gh) < -1e-9) and res.k == 2:
+            imax = int(np.argmax(gh))
+            st.caption(f"Ghi chú kỹ thuật: vì σ hai cụm khác nhau, γ_cao đạt cực đại {gh[imax]:.3f} tại x ≈ {grid[imax]:.2f} "
+                       f"rồi giảm nhẹ về {gh[-1]:.3f} ở x = {grid[-1]:.1f}.")
+
+        p1, p2 = st.columns(2)
+        p1.pyplot(plot_spectrum(res, sub[group_col].astype(str).values, x_hi=xh, x_lo=xl), clear_figure=True)
+        p2.pyplot(plot_gamma(res, th_hi, th_lo, xh, xl), clear_figure=True)
+
+        show_cols = [x for x in [id_col] if x] + [k for k in sub.columns if k.lower().strip() == "lớp"] + \
+                    [group_col, c, "γ_cao", ZQ]
+        show_cols = list(dict.fromkeys(show_cols))
+        fmt_map = {c: "{:.2f}", "γ_cao": "{:.3f}", ZQ: "{:.2f}"}
+        t1, t2 = st.columns(2)
+        with t1:
+            st.markdown(f"**{g_low} có γ_cao > {th_hi:.2f}** ({len(up)} học sinh)")
+            st.dataframe(up[show_cols].style.format(fmt_map), hide_index=True, width="stretch", height=360)
+        with t2:
+            st.markdown(f"**{g_high} có γ_cao < {th_lo:.2f}** ({len(down)} học sinh)")
+            st.dataframe(down[show_cols].style.format(fmt_map), hide_index=True, width="stretch", height=360)
+    st.warning(DISCLAIMER)
+
+# ---------------------------------------------------------------------------
+# Tab 3: Tiến bộ
+# ---------------------------------------------------------------------------
+progress_df = None
+with tab3:
+    if len(score_cols) < 2:
+        st.info("Chọn ít nhất **hai cột điểm** (ví dụ Giữa kỳ và Cuối kỳ) để so sánh tiến bộ.")
+    else:
+        a, b = st.columns(2)
+        c1 = a.selectbox("Mốc trước", score_cols, index=0)
+        c2 = b.selectbox("Mốc sau", score_cols, index=1)
+        if c1 == c2:
+            st.warning("Hãy chọn hai cột điểm khác nhau.")
         else:
-            render_progress_comparison(raw, group_col, results_by_col, col_from, col_to)
+            r1, r2 = results[c1], results[c2]
+            s1, s2 = subsets[c1], subsets[c2]
+            idx = s1.index.intersection(s2.index)
+            prog = df.loc[idx, [x for x in [id_col, group_col] if x]].copy()
+            prog[c1], prog[c2] = df.loc[idx, c1], df.loc[idx, c2]
+            prog[f"Z_q {c1}"], prog[f"Z_q {c2}"] = s1.loc[idx, ZQ], s2.loc[idx, ZQ]
+            prog["ΔZ_q"] = prog[f"Z_q {c2}"] - prog[f"Z_q {c1}"]
+            has_zs = ZS in s1.columns and ZS in s2.columns
+            if has_zs:
+                prog["ΔZ* (đối chứng)"] = s2.loc[idx, ZS] - s1.loc[idx, ZS]
+            progress_df = prog
 
-st.markdown("---")
-st.caption(
-    "Phương pháp: hệ thống tự động dò số đỉnh (k=1..k_max) của phổ điểm bằng tiêu chuẩn BIC, "
-    "không áp đặt sẵn số cụm. Với k ≥ 2, Z-score GMM Mềm chuẩn hoá điểm theo trung bình có "
-    "trọng số xác suất hậu nghiệm (γ) giữa các thành phần Gauss, tránh phân loại cứng gây bất "
-    "công ở vùng ranh giới."
-)
+            if r1.k != r2.k:
+                st.warning(f"Hai mốc có số thành phần khác nhau (k = {r1.k} và k = {r2.k}): "
+                           "ΔZ\\* không so sánh được trực tiếp. Chỉ dùng ΔZ_q.")
+            if any(r.mono and not r.mono["monotone"] for r in (r1, r2)):
+                st.warning("Z\\* không đơn điệu ở ít nhất một mốc: ΔZ\\* chỉ mang tính đối chứng.")
+            st.success("Tiến bộ tương đối được đo bằng **ΔZ_q = Z_q(mốc sau) − Z_q(mốc trước)**. "
+                       "ΔZ_q > 0: vị trí tương đối của học sinh trong khối được cải thiện.")
+
+            m1, m2, m3 = st.columns(3)
+            m1.metric("Số học sinh có đủ hai mốc", len(prog))
+            m2.metric("Tiến bộ (ΔZ_q > 0.5)", int((prog["ΔZ_q"] > 0.5).sum()))
+            m3.metric("Sụt giảm (ΔZ_q < −0.5)", int((prog["ΔZ_q"] < -0.5).sum()))
+
+            p1, p2 = st.columns([1.2, 1])
+            p1.pyplot(plot_progress(prog["ΔZ_q"].to_numpy(),
+                                    prog[group_col].astype(str).values if group_col else None), clear_figure=True)
+            if group_col:
+                agg = {"ΔZ_q": ["count", "mean", "std"]}
+                if has_zs:
+                    agg["ΔZ* (đối chứng)"] = ["mean"]
+                g = prog.groupby(group_col).agg(agg)
+                g.columns = ["N", "ΔZ_q trung bình", "ΔZ_q độ lệch chuẩn"] + (["ΔZ* trung bình"] if has_zs else [])
+                p2.markdown("**Theo loại hình lớp**")
+                p2.dataframe(g.style.format("{:.3f}", subset=[x for x in g.columns if x != "N"]),
+                             width="stretch")
+
+            fm = {k: "{:.2f}" for k in prog.columns if k not in (id_col, group_col)}
+            t1, t2 = st.columns(2)
+            t1.markdown("**10 học sinh tiến bộ nhiều nhất**")
+            t1.dataframe(prog.nlargest(10, "ΔZ_q").style.format(fm), hide_index=True, width="stretch")
+            t2.markdown("**10 học sinh sụt giảm nhiều nhất**")
+            t2.dataframe(prog.nsmallest(10, "ΔZ_q").style.format(fm), hide_index=True, width="stretch")
+    st.caption(DISCLAIMER)
+
+# ---------------------------------------------------------------------------
+# Tab 4: Kết quả & tải về
+# ---------------------------------------------------------------------------
+with tab4:
+    out = df.copy()
+    summary_rows, bic_rows = [], []
+    for c in score_cols:
+        res, sub = results[c], subsets[c]
+        for name in ["Z truyền thống", "Z theo nhóm hành chính", ZS, ZQ, "γ_cao"]:
+            if name in sub.columns:
+                out.loc[sub.index, f"{name} [{c}]"] = sub[name]
+        mono_txt = "—" if res.k == 1 else ("Có" if res.mono["monotone"] else
+                                           "Không: " + "; ".join(f"[{a:.2f};{b:.2f}]" for a, b in res.mono["intervals"]))
+        summary_rows.append({
+            "Cột điểm": c, "N": len(res.x), "k được chọn": res.k,
+            "ΔBIC (1→2)": res.selection["delta_1_to_2"], "Mức bằng chứng": raftery_label(res.selection["delta_1_to_2"]),
+            "Số đỉnh": res.n_modes, "Z* đơn điệu": mono_txt,
+            "x* cụm cao (γ>0.7)": x_star_high(res.mix, 0.7, res.lo, res.hi) if res.k >= 2 else None,
+            "x* cụm thấp (γ<0.3)": x_star_low(res.mix, 0.3, res.lo, res.hi) if res.k >= 2 else None,
+            "Chỉ số chính thức": "Z truyền thống" if res.k == 1 else "Z_q",
+            "Tham số (π; μ; σ)": " | ".join(f"{w:.3f}; {m:.2f}; {s:.2f}"
+                                            for w, m, s in zip(res.mix.weights, res.mix.means, res.mix.sds)),
+        })
+        for k, v in res.selection["bics"].items():
+            bic_rows.append({"Cột điểm": c, "k": k, "BIC": v})
+    if progress_df is not None:
+        out.loc[progress_df.index, "ΔZ_q"] = progress_df["ΔZ_q"]
+
+    summary = pd.DataFrame(summary_rows)
+    st.markdown("**Tóm tắt mô hình**")
+    st.dataframe(summary, hide_index=True, width="stretch")
+    st.markdown("**Bảng kết quả chi tiết**")
+    st.dataframe(out, hide_index=True, width="stretch", height=420)
+
+    buf = io.BytesIO()
+    with pd.ExcelWriter(buf, engine="openpyxl") as xw:
+        out.to_excel(xw, sheet_name="Ket_qua", index=False)
+        summary.to_excel(xw, sheet_name="Tom_tat_mo_hinh", index=False)
+        pd.DataFrame(bic_rows).to_excel(xw, sheet_name="BIC", index=False)
+        for c, (up, down) in outlier_tables.items():
+            up.to_excel(xw, sheet_name="Ngoai_le_cum_cao"[:31], index=False)
+            down.to_excel(xw, sheet_name="Ngoai_le_cum_thap"[:31], index=False)
+        if progress_df is not None:
+            progress_df.to_excel(xw, sheet_name="Tien_bo", index=False)
+        pd.DataFrame({"Khuyến cáo": [DISCLAIMER.replace("*", "")]}).to_excel(xw, sheet_name="Khuyen_cao", index=False)
+    st.download_button("⬇️ Tải kết quả (Excel)", buf.getvalue(), file_name="SmartZ-EDU_ket_qua.xlsx",
+                       mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                       type="primary")
+    st.caption(DISCLAIMER)
+
+# ---------------------------------------------------------------------------
+# Tab 5: Phương pháp
+# ---------------------------------------------------------------------------
+with tab5:
+    st.markdown("### Quy trình 5 bước (áp dụng riêng cho từng cột điểm)")
+    st.markdown(
+        "1. **Thống kê mô tả & kiểm tra cấu trúc hỗn hợp** — Shapiro–Wilk sàng lọc, kiểm định tỉ số hợp lý "
+        "bằng bootstrap tham số (k = 1 so với k = 2).\n"
+        "2. **Cơ chế thích ứng tự động** — ước lượng GMM với k = 1…4, chọn k có BIC nhỏ nhất, diễn giải ΔBIC "
+        "theo thang Raftery. Nếu k = 1 dùng Z truyền thống.\n"
+        "3. **Xây dựng chỉ số** — Z truyền thống, Z\\* (GMM mềm), Z_q (lượng tử hoá), kèm Z theo nhóm hành chính.\n"
+        "4. **Kiểm tra tính đơn điệu** — quét lưới bước 0.01; nếu Z\\* có đoạn giảm thì cảnh báo và dùng Z_q.\n"
+        "5. **Ngoại lệ sư phạm & tiến bộ** — γ_cao, ngưỡng điểm x\\* tương đương, ΔZ_q.")
+    st.markdown("### Công thức")
+    st.latex(r"z = \frac{x-\mu}{\sigma}")
+    st.latex(r"\gamma_j(x) = \frac{\pi_j\,\mathcal N(x;\mu_j,\sigma_j)}{\sum_{i=1}^{K}\pi_i\,\mathcal N(x;\mu_i,\sigma_i)}")
+    st.latex(r"Z^* = \sum_{j=1}^{K}\gamma_j(x)\,z_j,\qquad z_j=\frac{x-\mu_j}{\sigma_j}")
+    st.latex(r"Z_q = \Phi^{-1}\!\big(F_{mix}(x)\big),\qquad F_{mix}(x)=\sum_{j=1}^{K}\pi_j\,\Phi\!\Big(\frac{x-\mu_j}{\sigma_j}\Big)")
+    st.markdown(
+        "**Định lý 1.** Với hai thành phần cùng phương sai σ, Z\\* đơn điệu tăng trên toàn trục số "
+        "khi và chỉ khi Δ = |μ₂ − μ₁| ≤ 2σ.\n\n"
+        "**Định lý 2.** Với mọi tham số (π_j > 0, σ_j > 0), Z_q đơn điệu tăng nghiêm ngặt — "
+        "không bao giờ đảo ngược thứ tự điểm số.\n\n"
+        "**Lưu ý về phạm vi ý nghĩa.** Vì Z_q là phép biến đổi đơn điệu của điểm, thứ hạng theo Z_q trùng "
+        "thứ hạng theo điểm thô trong cùng một đợt. Giá trị của Z_q nằm ở thang đo có ý nghĩa xác suất đúng, "
+        "khả năng so sánh giữa các đợt đánh giá, và các đại lượng phụ trợ như γ.")
+    st.markdown("### Tái lập")
+    st.code("GaussianMixture(n_components=k, covariance_type='full', n_init=20, random_state=42)", language="python")
+    st.caption(DISCLAIMER)
