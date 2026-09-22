@@ -1,10 +1,553 @@
 """
+SmartZ-EDU — bản một file (single-file) để deploy lên Streamlit Community Cloud.
+Chuẩn hoá điểm số khi phổ điểm không thuần nhất bằng GMM thích ứng và Z-score lượng tử hoá Z_q.
+"""
+from __future__ import annotations
+
+import io
+import re
+import unicodedata
+
+
+# ===========================================================================
+# PHẦN 1 — LÕI TÍNH TOÁN
+# ===========================================================================
+"""
+Lõi tính toán của SmartZ-EDU.
+
+Toàn bộ công thức bám sát mục 3.2 – 3.4 của báo cáo:
+  - Cơ chế thích ứng: GMM k = 1..4, chọn k có BIC nhỏ nhất, diễn giải ΔBIC theo thang Raftery.
+  - Kiểm định tỉ số hợp lý bằng bootstrap tham số (k = 1 so với k = 2).
+  - Ba chỉ số: Z truyền thống, Z* (GMM mềm), Z_q (lượng tử hoá theo hỗn hợp).
+  - Kiểm tra tính đơn điệu của Z* trên lưới bước 0.01.
+  - γ_cao, ngưỡng điểm x* tương đương, ngoại lệ sư phạm.
+Cấu hình tái lập: random_state = 42, n_init = 20, covariance_type = 'full'.
+"""
+
+from dataclasses import dataclass, field
+
+import numpy as np
+from scipy import stats
+from scipy.optimize import brentq
+from scipy.signal import argrelextrema
+from sklearn.mixture import GaussianMixture
+
+RANDOM_STATE = 42
+N_INIT = 20
+COV_TYPE = "full"
+K_MAX = 4
+GRID_STEP = 0.01
+
+
+# ---------------------------------------------------------------------------
+# Tiện ích
+# ---------------------------------------------------------------------------
+def raftery_label(delta_bic: float) -> str:
+    """Diễn giải chênh lệch BIC theo thang Raftery (1995)."""
+    d = abs(delta_bic)
+    if d <= 2:
+        return "Không phân biệt được"
+    if d <= 6:
+        return "Bằng chứng yếu"
+    if d <= 10:
+        return "Bằng chứng mạnh"
+    return "Bằng chứng rất mạnh"
+
+
+def fit_gmm(x: np.ndarray, k: int, n_init: int = N_INIT,
+            random_state: int = RANDOM_STATE, cov_type: str = COV_TYPE) -> GaussianMixture:
+    g = GaussianMixture(n_components=k, covariance_type=cov_type, n_init=n_init,
+                        random_state=random_state)
+    g.fit(np.asarray(x, dtype=float).reshape(-1, 1))
+    return g
+
+
+@dataclass
+class MixParams:
+    """Tham số hỗn hợp 1 chiều, sắp theo trung bình tăng dần."""
+    weights: np.ndarray
+    means: np.ndarray
+    sds: np.ndarray
+
+    @property
+    def k(self) -> int:
+        return len(self.means)
+
+    @classmethod
+    def from_gmm(cls, g: GaussianMixture) -> "MixParams":
+        w = g.weights_.ravel()
+        m = g.means_.ravel()
+        cov = g.covariances_
+        if g.covariance_type == "full":
+            v = cov.reshape(len(w), -1)[:, 0]
+        elif g.covariance_type == "tied":
+            v = np.full(len(w), np.ravel(cov)[0])
+        elif g.covariance_type == "diag":
+            v = cov.ravel()
+        else:  # spherical
+            v = cov.ravel()
+        order = np.argsort(m)
+        return cls(w[order], m[order], np.sqrt(v[order]))
+
+    # --- các đại lượng của hỗn hợp -------------------------------------
+    def comp_pdf(self, x):
+        x = np.asarray(x, dtype=float)[:, None]
+        return self.weights * stats.norm.pdf(x, self.means, self.sds)
+
+    def pdf(self, x):
+        return self.comp_pdf(x).sum(axis=1)
+
+    def cdf(self, x):
+        x = np.asarray(x, dtype=float)[:, None]
+        return (self.weights * stats.norm.cdf(x, self.means, self.sds)).sum(axis=1)
+
+    def gamma(self, x):
+        """γ_j(x) — xác suất hậu nghiệm thuộc thành phần j (cột j)."""
+        p = self.comp_pdf(x)
+        s = p.sum(axis=1, keepdims=True)
+        s[s == 0] = np.finfo(float).tiny
+        return p / s
+
+    def gamma_high(self, x):
+        """γ_cao(x): xác suất thuộc thành phần có trung bình cao nhất."""
+        return self.gamma(x)[:, -1]
+
+    def z_soft(self, x):
+        """Z* = Σ γ_j(x) · (x − μ_j)/σ_j."""
+        x = np.asarray(x, dtype=float)
+        zj = (x[:, None] - self.means) / self.sds
+        return (self.gamma(x) * zj).sum(axis=1)
+
+    def z_quantile(self, x):
+        """Z_q = Φ⁻¹(F_mix(x)) — luôn đơn điệu tăng nghiêm ngặt (Định lý 2)."""
+        F = np.clip(self.cdf(x), 1e-12, 1 - 1e-12)
+        return stats.norm.ppf(F)
+
+
+# ---------------------------------------------------------------------------
+# Bước 1 – Thống kê mô tả
+# ---------------------------------------------------------------------------
+def describe_by_group(x: np.ndarray, groups: np.ndarray | None):
+    rows = []
+
+    def _row(name, v):
+        v = np.asarray(v, dtype=float)
+        sw_p = stats.shapiro(v).pvalue if 3 <= len(v) <= 5000 else np.nan
+        return {
+            "Nhóm": name, "N": len(v), "Trung bình": v.mean(),
+            "Độ lệch chuẩn": v.std(ddof=1) if len(v) > 1 else np.nan,
+            "Trung vị": np.median(v), "Độ lệch (skew)": stats.skew(v) if len(v) > 2 else np.nan,
+            "Shapiro–Wilk p": sw_p,
+        }
+
+    if groups is not None:
+        for gname in sorted(pd_unique(groups)):
+            rows.append(_row(str(gname), x[groups == gname]))
+    rows.append(_row("Toàn khối", x))
+    return rows
+
+
+def pd_unique(a):
+    seen, out = set(), []
+    for v in a:
+        if v not in seen:
+            seen.add(v)
+            out.append(v)
+    return out
+
+
+# ---------------------------------------------------------------------------
+# Bước 2 – Cơ chế thích ứng + bootstrap LRT
+# ---------------------------------------------------------------------------
+def adaptive_selection(x: np.ndarray, k_max: int = K_MAX, n_init: int = N_INIT,
+                       random_state: int = RANDOM_STATE):
+    x = np.asarray(x, dtype=float)
+    k_max = int(min(k_max, max(1, len(np.unique(x)) - 1)))
+    models, bics = {}, {}
+    for k in range(1, k_max + 1):
+        g = fit_gmm(x, k, n_init=n_init, random_state=random_state)
+        models[k] = g
+        bics[k] = g.bic(x.reshape(-1, 1))
+    k_best = min(bics, key=bics.get)
+    sorted_bic = sorted(bics.values())
+    d_runner = sorted_bic[1] - sorted_bic[0] if len(sorted_bic) > 1 else np.nan
+    d_1_to_2 = bics[1] - bics[2] if 2 in bics else np.nan
+    return {
+        "models": models, "bics": bics, "k_best": k_best,
+        "delta_runner_up": d_runner, "delta_1_to_2": d_1_to_2,
+    }
+
+
+def bootstrap_lrt(x: np.ndarray, B: int = 200, n_init_boot: int = 5,
+                  random_state: int = RANDOM_STATE, progress=None):
+    """Kiểm định tỉ số hợp lý H0: k = 1 so với H1: k = 2 bằng bootstrap tham số."""
+    x = np.asarray(x, dtype=float).reshape(-1, 1)
+    n = len(x)
+    g1 = fit_gmm(x, 1)
+    g2 = fit_gmm(x, 2)
+    lrt_obs = 2 * n * (g2.score(x) - g1.score(x))
+    mu, sd = g1.means_.ravel()[0], np.sqrt(g1.covariances_.ravel()[0])
+    rng = np.random.default_rng(random_state)
+    null = np.empty(B)
+    for b in range(B):
+        xb = rng.normal(mu, sd, size=n).reshape(-1, 1)
+        h1 = fit_gmm(xb, 1, n_init=1)
+        h2 = fit_gmm(xb, 2, n_init=n_init_boot, random_state=random_state + b)
+        null[b] = max(0.0, 2 * n * (h2.score(xb) - h1.score(xb)))
+        if progress is not None:
+            progress((b + 1) / B)
+    p = (1 + np.sum(null >= lrt_obs)) / (B + 1)
+    return {"lrt_obs": lrt_obs, "crit95": float(np.quantile(null, 0.95)),
+            "p_value": float(p), "B": B, "null": null}
+
+
+def count_modes(mix: MixParams, lo: float, hi: float) -> tuple[int, np.ndarray]:
+    grid = np.arange(lo, hi + GRID_STEP / 2, GRID_STEP)
+    dens = mix.pdf(grid)
+    idx = argrelextrema(dens, np.greater)[0]
+    return len(idx), grid[idx]
+
+
+# ---------------------------------------------------------------------------
+# Bước 4 – Kiểm tra tính đơn điệu của Z*
+# ---------------------------------------------------------------------------
+def monotonicity_check(mix: MixParams, lo: float, hi: float):
+    """Quét lưới bước 0.01, trả về các khoảng mà Z* giảm."""
+    grid = np.round(np.arange(lo, hi + GRID_STEP / 2, GRID_STEP), 4)
+    z = mix.z_soft(grid)
+    dec = np.diff(z) < -1e-12
+    intervals = []
+    i = 0
+    while i < len(dec):
+        if dec[i]:
+            j = i
+            while j + 1 < len(dec) and dec[j + 1]:
+                j += 1
+            intervals.append((float(grid[i]), float(grid[j + 1])))
+            i = j + 1
+        else:
+            i += 1
+    # Điều kiện Δ ≤ 2σ của Định lý 1 (dùng σ gộp, chỉ để tham khảo khi k = 2)
+    theorem = None
+    if mix.k == 2:
+        delta = mix.means[1] - mix.means[0]
+        sigma_pool = float(np.sqrt(np.sum(mix.weights * mix.sds ** 2)))
+        theorem = {"delta": float(delta), "sigma_pool": sigma_pool,
+                   "ratio": float(delta / sigma_pool),
+                   "predict_monotone": bool(delta <= 2 * sigma_pool)}
+    return {"monotone": len(intervals) == 0, "intervals": intervals, "theorem": theorem}
+
+
+# ---------------------------------------------------------------------------
+# Bước 5 – ngưỡng x* tương đương
+# ---------------------------------------------------------------------------
+def _gamma_crossing(mix: MixParams, threshold: float, lo: float, hi: float) -> float | None:
+    """Nghiệm đầu tiên (tính từ điểm thấp) của γ_cao(x) = threshold, làm tròn 2 chữ số."""
+    grid = np.arange(lo, hi + GRID_STEP / 2, GRID_STEP)
+    f = mix.gamma_high(grid) - threshold
+    idx = np.where((f[:-1] < 0) & (f[1:] >= 0))[0]
+    if len(idx) == 0:
+        return None
+    i = idx[0]
+    root = brentq(lambda t: mix.gamma_high(np.array([t]))[0] - threshold, grid[i], grid[i + 1])
+    return round(float(root), 2)
+
+
+def x_star_high(mix: MixParams, threshold: float, lo: float, hi: float) -> float | None:
+    """Ngưỡng điểm x* tương đương với γ_cao = threshold (ngoại lệ chiều lên: điểm ≥ x*)."""
+    return _gamma_crossing(mix, threshold, lo, hi)
+
+
+def x_star_low(mix: MixParams, threshold: float, lo: float, hi: float) -> float | None:
+    """Ngưỡng điểm x* tương đương với γ_cao = threshold (ngoại lệ chiều xuống: điểm ≤ x*)."""
+    return _gamma_crossing(mix, threshold, lo, hi)
+
+
+# ---------------------------------------------------------------------------
+# Tổng hợp cho một cột điểm
+# ---------------------------------------------------------------------------
+@dataclass
+class ColumnResult:
+    name: str
+    x: np.ndarray
+    selection: dict
+    k: int
+    mix: MixParams
+    lo: float
+    hi: float
+    mono: dict | None
+    n_modes: int
+    mode_locs: np.ndarray
+    scores: dict = field(default_factory=dict)  # tên chỉ số -> mảng giá trị
+
+
+def analyse_column(name: str, x: np.ndarray, groups: np.ndarray | None,
+                   k_override: int | None = None, scale=(0.0, 10.0)) -> ColumnResult:
+    x = np.asarray(x, dtype=float)
+    sel = adaptive_selection(x)
+    k = k_override if k_override else sel["k_best"]
+    k = min(k, max(sel["models"]))
+    mix = MixParams.from_gmm(sel["models"][k])
+    lo = float(min(scale[0], x.min()))
+    hi = float(max(scale[1], x.max()))
+    n_modes, mode_locs = count_modes(mix, lo, hi)
+
+    scores = {}
+    z_trad = (x - x.mean()) / x.std(ddof=0)
+    scores["Z truyền thống"] = z_trad
+    if groups is not None:
+        zg = np.full_like(x, np.nan)
+        for gname in pd_unique(groups):
+            m = groups == gname
+            sd = x[m].std(ddof=0)
+            zg[m] = (x[m] - x[m].mean()) / sd if sd > 0 else 0.0
+        scores["Z theo nhóm hành chính"] = zg
+
+    mono = None
+    if k >= 2:
+        scores["Z* (GMM mềm)"] = mix.z_soft(x)
+        scores["Z_q (lượng tử hoá)"] = mix.z_quantile(x)
+        scores["γ_cao"] = mix.gamma_high(x)
+        mono = monotonicity_check(mix, lo, hi)
+    else:
+        # k = 1: Z_q trùng Z truyền thống (Φ⁻¹(Φ(z)) = z)
+        scores["Z_q (lượng tử hoá)"] = z_trad
+
+    return ColumnResult(name, x, sel, k, mix, lo, hi, mono, n_modes, mode_locs, scores)
+
+
+def official_index_name(res: ColumnResult) -> str:
+    return "Z_q (lượng tử hoá)"
+
+
+# ===========================================================================
+# PHẦN 2 — ĐỌC FILE
+# ===========================================================================
+"""Đọc file điểm Excel/CSV, tự nhận diện dòng tiêu đề và đoán các cột."""
+
+
+
+
+def _norm(s: str) -> str:
+    s = unicodedata.normalize("NFC", str(s)).lower().strip()
+    return re.sub(r"\s+", " ", s)
+
+
+def _is_texty(v) -> bool:
+    if pd.isna(v):
+        return False
+    if isinstance(v, (int, float, np.number)):
+        return False
+    try:
+        float(str(v).replace(",", "."))
+        return False
+    except ValueError:
+        return True
+
+
+def detect_header_row(raw: pd.DataFrame, max_scan: int = 20) -> int:
+    """Chọn dòng đầu tiên mà phần lớn ô là chữ và dòng ngay dưới có số."""
+    best, best_score = 0, -1.0
+    for i in range(min(max_scan, len(raw) - 1)):
+        row = raw.iloc[i]
+        nonnull = row.notna().sum()
+        if nonnull < 2:
+            continue
+        text_ratio = sum(_is_texty(v) for v in row) / nonnull
+        nxt = raw.iloc[i + 1]
+        num_next = sum((not _is_texty(v)) and pd.notna(v) for v in nxt)
+        score = text_ratio * nonnull + 0.5 * num_next
+        if text_ratio >= 0.6 and score > best_score:
+            best, best_score = i, score
+            if text_ratio == 1.0 and num_next >= 1:
+                break
+    return best
+
+
+def list_sheets(file_bytes: bytes, filename: str) -> list[str]:
+    if filename.lower().endswith((".xlsx", ".xlsm", ".xls")):
+        return pd.ExcelFile(io.BytesIO(file_bytes)).sheet_names
+    return ["(CSV)"]
+
+
+def read_raw(file_bytes: bytes, filename: str, sheet: str | None) -> pd.DataFrame:
+    if filename.lower().endswith((".xlsx", ".xlsm", ".xls")):
+        return pd.read_excel(io.BytesIO(file_bytes), sheet_name=sheet, header=None)
+    text = file_bytes.decode("utf-8-sig", errors="replace")
+    sep = ";" if text.count(";") > text.count(",") else ","
+    return pd.read_csv(io.StringIO(text), header=None, sep=sep)
+
+
+def apply_header(raw: pd.DataFrame, header_row: int) -> pd.DataFrame:
+    cols, seen = [], {}
+    for j, c in enumerate(raw.iloc[header_row]):
+        name = str(c).strip() if pd.notna(c) else f"Cột {j + 1}"
+        if name in seen:
+            seen[name] += 1
+            name = f"{name} ({seen[name]})"
+        else:
+            seen[name] = 0
+        cols.append(name)
+    df = raw.iloc[header_row + 1:].copy()
+    df.columns = cols
+    df = df.dropna(how="all").reset_index(drop=True)
+    for c in df.columns:
+        conv = pd.to_numeric(df[c].astype(str).str.replace(",", ".", regex=False), errors="coerce")
+        if conv.notna().sum() >= 0.8 * df[c].notna().sum() and df[c].notna().sum() > 0:
+            df[c] = conv
+    return df
+
+
+def guess_group_col(df: pd.DataFrame) -> str | None:
+    for c in df.columns:
+        if "loại hình" in _norm(c) or "loai hinh" in _norm(c):
+            return c
+    cands = [c for c in df.columns
+             if not pd.api.types.is_numeric_dtype(df[c]) and 2 <= df[c].nunique(dropna=True) <= 5]
+    return cands[0] if cands else None
+
+
+def guess_score_cols(df: pd.DataFrame) -> list[str]:
+    out = []
+    for c in df.columns:
+        if not pd.api.types.is_numeric_dtype(df[c]):
+            continue
+        v = df[c].dropna()
+        if len(v) < 10 or v.nunique() < 5:
+            continue
+        if v.min() >= 0 and v.max() <= 10:
+            out.append(c)
+    pri = [c for c in out if "điểm" in _norm(c) or "diem" in _norm(c)]
+    return pri or out
+
+
+def guess_id_col(df: pd.DataFrame) -> str | None:
+    for c in df.columns:
+        n = _norm(c)
+        if any(k in n for k in ["mã", "ma hs", "id", "stt", "họ tên", "ho ten"]):
+            return c
+    return None
+
+
+# ===========================================================================
+# PHẦN 3 — BIỂU ĐỒ
+# ===========================================================================
+"""Biểu đồ matplotlib cho SmartZ-EDU."""
+
+import matplotlib
+
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+
+
+plt.rcParams.update({
+    "font.family": "DejaVu Sans",
+    "axes.spines.top": False,
+    "axes.spines.right": False,
+    "axes.grid": True,
+    "grid.alpha": 0.25,
+    "figure.dpi": 110,
+})
+
+PALETTE = ["#2563eb", "#f97316", "#16a34a", "#9333ea", "#dc2626"]
+
+
+def plot_spectrum(res: ColumnResult, groups=None, x_hi=None, x_lo=None):
+    fig, ax = plt.subplots(figsize=(8.5, 4.2))
+    x = res.x
+    bins = np.arange(np.floor(res.lo), np.ceil(res.hi) + 0.5, 0.5)
+    if groups is not None:
+        labels = pd_unique(groups)
+        data = [x[groups == g] for g in labels]
+        ax.hist(data, bins=bins, stacked=True, density=True, alpha=0.45,
+                color=PALETTE[: len(labels)], label=[str(l) for l in labels], edgecolor="white")
+    else:
+        ax.hist(x, bins=bins, density=True, alpha=0.45, color="#94a3b8", edgecolor="white",
+                label="Học sinh")
+    grid = np.linspace(res.lo, res.hi, 600)
+    ax.plot(grid, res.mix.pdf(grid), color="black", lw=2.2, label=f"Mật độ hỗn hợp (k = {res.k})")
+    if res.k >= 2:
+        comps = res.mix.comp_pdf(grid)
+        for j in range(res.k):
+            ax.plot(grid, comps[:, j], ls="--", lw=1.4, color=PALETTE[j % 5],
+                    label=f"Thành phần {j + 1}: μ={res.mix.means[j]:.2f}, σ={res.mix.sds[j]:.2f}")
+    for m in res.mode_locs:
+        ax.axvline(m, color="gray", lw=0.8, ls=":")
+    if x_hi is not None:
+        ax.axvline(x_hi, color="#dc2626", lw=1.5, label=f"x* cụm cao = {x_hi:.2f}")
+    if x_lo is not None:
+        ax.axvline(x_lo, color="#0891b2", lw=1.5, label=f"x* cụm thấp = {x_lo:.2f}")
+    ax.set_xlabel("Điểm")
+    ax.set_ylabel("Mật độ")
+    ax.set_title(f"Phổ điểm – {res.name}")
+    ax.legend(fontsize=8, loc="upper left", frameon=False)
+    fig.tight_layout()
+    return fig
+
+
+def plot_indices(res: ColumnResult):
+    fig, ax = plt.subplots(figsize=(8.5, 4.0))
+    grid = np.round(np.arange(res.lo, res.hi + 0.005, 0.01), 4)
+    mu, sd = res.x.mean(), res.x.std(ddof=0)
+    ax.plot(grid, (grid - mu) / sd, color="#64748b", lw=1.5, label="Z truyền thống")
+    if res.k >= 2:
+        ax.plot(grid, res.mix.z_soft(grid), color="#f97316", lw=2, label="Z* (GMM mềm)")
+        ax.plot(grid, res.mix.z_quantile(grid), color="#2563eb", lw=2.2, label="Z_q (lượng tử hoá)")
+        if res.mono and not res.mono["monotone"]:
+            for a, b in res.mono["intervals"]:
+                ax.axvspan(a, b, color="#fecaca", alpha=0.6)
+            ax.plot([], [], color="#fecaca", lw=8, label="Vùng Z* giảm (không đơn điệu)")
+    ax.set_xlabel("Điểm x")
+    ax.set_ylabel("Giá trị chỉ số")
+    ax.set_title("So sánh các chỉ số chuẩn hoá theo điểm")
+    ax.legend(fontsize=8, frameon=False)
+    fig.tight_layout()
+    return fig
+
+
+def plot_gamma(res: ColumnResult, th_hi: float, th_lo: float, x_hi=None, x_lo=None):
+    fig, ax = plt.subplots(figsize=(8.5, 3.4))
+    grid = np.linspace(res.lo, res.hi, 600)
+    ax.plot(grid, res.mix.gamma_high(grid), color="#9333ea", lw=2, label="γ_cao(x)")
+    ax.axhline(th_hi, color="#dc2626", ls="--", lw=1, label=f"Ngưỡng cao = {th_hi:.2f}")
+    ax.axhline(th_lo, color="#0891b2", ls="--", lw=1, label=f"Ngưỡng thấp = {th_lo:.2f}")
+    if x_hi is not None:
+        ax.axvline(x_hi, color="#dc2626", lw=1)
+    if x_lo is not None:
+        ax.axvline(x_lo, color="#0891b2", lw=1)
+    ax.set_ylim(-0.02, 1.02)
+    ax.set_xlabel("Điểm x")
+    ax.set_ylabel("γ_cao")
+    ax.set_title("Xác suất thuộc cụm điểm cao theo điểm số")
+    ax.legend(fontsize=8, frameon=False, loc="upper left")
+    fig.tight_layout()
+    return fig
+
+
+def plot_progress(dz, groups=None, label="ΔZ_q"):
+    fig, ax = plt.subplots(figsize=(8.5, 3.6))
+    if groups is not None:
+        labels = pd_unique(groups)
+        ax.boxplot([dz[groups == g] for g in labels], vert=False, widths=0.5)
+        ax.set_yticks(range(1, len(labels) + 1), [str(l) for l in labels])
+    else:
+        ax.hist(dz, bins=30, color="#2563eb", alpha=0.7)
+    ax.axvline(0, color="black", lw=1)
+    ax.set_xlabel(label)
+    ax.set_title(f"Phân bố tiến bộ tương đối ({label})")
+    fig.tight_layout()
+    return fig
+
+
+# ===========================================================================
+# PHẦN 4 — GIAO DIỆN
+# ===========================================================================
+"""
 SmartZ-EDU — Chuẩn hoá điểm số khi phổ điểm không thuần nhất
 bằng Mô hình Hỗn hợp Gauss (GMM) và Z-score lượng tử hoá Z_q.
 
 Chạy cục bộ:   streamlit run app.py
 """
-from __future__ import annotations
 
 import io
 from pathlib import Path
@@ -13,15 +556,13 @@ import numpy as np
 import pandas as pd
 import streamlit as st
 
-from core.io import (apply_header, detect_header_row, guess_group_col, guess_id_col,
-                     guess_score_cols, list_sheets, read_raw)
-from core.model import (analyse_column, bootstrap_lrt, describe_by_group, pd_unique,
-                        raftery_label, x_star_high, x_star_low)
-from core.plots import plot_gamma, plot_indices, plot_progress, plot_spectrum
 
 st.set_page_config(page_title="SmartZ-EDU", page_icon="📊", layout="wide")
 
-SAMPLE_PATH = Path(__file__).parent / "data" / "Diem_GK_CK_An_Danh_4Khoi.xlsx"
+_HERE = Path(__file__).parent
+SAMPLE_PATH = next((p for p in [_HERE / "data" / "Diem_GK_CK_An_Danh_4Khoi.xlsx",
+                     _HERE / "Diem_GK_CK_An_Danh_4Khoi.xlsx"] if p.exists()),
+                    _HERE / "data" / "Diem_GK_CK_An_Danh_4Khoi.xlsx")
 ZQ = "Z_q (lượng tử hoá)"
 ZS = "Z* (GMM mềm)"
 
