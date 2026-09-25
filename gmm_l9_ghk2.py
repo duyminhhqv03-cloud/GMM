@@ -7,6 +7,15 @@ from __future__ import annotations
 import io
 import re
 import unicodedata
+from dataclasses import dataclass, field
+from pathlib import Path
+
+import numpy as np
+import pandas as pd
+from scipy import stats
+from scipy.optimize import brentq
+from scipy.signal import argrelextrema
+from sklearn.mixture import GaussianMixture
 
 
 # ===========================================================================
@@ -19,39 +28,36 @@ Toàn bộ công thức bám sát mục 3.2 – 3.4 của báo cáo:
   - Cơ chế thích ứng: GMM k = 1..4, chọn k có BIC nhỏ nhất, diễn giải ΔBIC theo thang Raftery.
   - Kiểm định tỉ số hợp lý bằng bootstrap tham số (k = 1 so với k = 2).
   - Ba chỉ số: Z truyền thống, Z* (GMM mềm), Z_q (lượng tử hoá theo hỗn hợp).
-  - Kiểm tra tính đơn điệu của Z* trên lưới bước 0.01.
+  - Kiểm tra tính đơn điệu của Z* trên lưới bước 0.01; đếm số đỉnh trên lưới bước 0.001.
+  - Phép thử Δ ≤ 2σ (Định lý 1) trên mô hình 'tied' khớp thêm, đúng như mục 4.3 của báo cáo.
   - γ_cao, ngưỡng điểm x* tương đương, ngoại lệ sư phạm.
-Cấu hình tái lập: random_state = 42, n_init = 20, covariance_type = 'full'.
+Cấu hình tái lập: random_state = 42, n_init = 20, covariance_type = 'full'
+(mẫu bootstrap dùng n_init = 5; mô hình quan sát vẫn n_init = 20).
 """
-
-from dataclasses import dataclass, field
-
-import numpy as np
-from scipy import stats
-from scipy.optimize import brentq
-from scipy.signal import argrelextrema
-from sklearn.mixture import GaussianMixture
 
 RANDOM_STATE = 42
 N_INIT = 20
+N_INIT_BOOT = 5          # cho từng mẫu giả bootstrap
 COV_TYPE = "full"
 K_MAX = 4
-GRID_STEP = 0.01
+GRID_STEP = 0.01         # quét đơn điệu Z* (mục 3.2, Bước 4)
+MODE_GRID_STEP = 0.001   # đếm số đỉnh mật độ (mục 3.2, Bước 1)
 
 
 # ---------------------------------------------------------------------------
 # Tiện ích
 # ---------------------------------------------------------------------------
-def raftery_label(delta_bic: float) -> str:
-    """Diễn giải chênh lệch BIC theo thang Raftery (1995)."""
+def raftery_label(delta_bic: float, favour: tuple[str, str] | None = None) -> str:
+    """Diễn giải chênh lệch BIC theo thang Raftery (1995), cách gọi như báo cáo:
+    0–2 không phân biệt được; 2–6 yếu; 6–10 mạnh; > 10 rất mạnh.
+    favour=(tên khi ΔBIC > 0, tên khi ΔBIC < 0) để ghi rõ chiều bằng chứng."""
     d = abs(delta_bic)
     if d <= 2:
         return "Không phân biệt được"
-    if d <= 6:
-        return "Bằng chứng yếu"
-    if d <= 10:
-        return "Bằng chứng mạnh"
-    return "Bằng chứng rất mạnh"
+    lab = "Bằng chứng yếu" if d <= 6 else ("Bằng chứng mạnh" if d <= 10 else "Bằng chứng rất mạnh")
+    if favour is not None:
+        lab += f" (ủng hộ {favour[0] if delta_bic > 0 else favour[1]})"
+    return lab
 
 
 def fit_gmm(x: np.ndarray, k: int, n_init: int = N_INIT,
@@ -178,9 +184,11 @@ def adaptive_selection(x: np.ndarray, k_max: int = K_MAX, n_init: int = N_INIT,
     }
 
 
-def bootstrap_lrt(x: np.ndarray, B: int = 200, n_init_boot: int = 5,
+def bootstrap_lrt(x: np.ndarray, B: int = 500, n_init_boot: int = N_INIT_BOOT,
                   random_state: int = RANDOM_STATE, progress=None):
-    """Kiểm định tỉ số hợp lý H0: k = 1 so với H1: k = 2 bằng bootstrap tham số."""
+    """Kiểm định tỉ số hợp lý H0: k = 1 so với H1: k = 2 bằng bootstrap tham số (McLachlan, 1987).
+    Mô hình quan sát dùng n_init = 20; mỗi mẫu giả dùng n_init = 5 để tiết kiệm thời gian.
+    p nhỏ nhất có thể là 1/(B + 1)."""
     x = np.asarray(x, dtype=float).reshape(-1, 1)
     n = len(x)
     g1 = fit_gmm(x, 1)
@@ -197,12 +205,13 @@ def bootstrap_lrt(x: np.ndarray, B: int = 200, n_init_boot: int = 5,
         if progress is not None:
             progress((b + 1) / B)
     p = (1 + np.sum(null >= lrt_obs)) / (B + 1)
-    return {"lrt_obs": lrt_obs, "crit95": float(np.quantile(null, 0.95)),
-            "p_value": float(p), "B": B, "null": null}
+    return {"lrt_obs": float(lrt_obs), "crit95": float(np.quantile(null, 0.95)),
+            "p_value": float(p), "p_min": 1.0 / (B + 1), "B": B, "null": null}
 
 
 def count_modes(mix: MixParams, lo: float, hi: float) -> tuple[int, np.ndarray]:
-    grid = np.arange(lo, hi + GRID_STEP / 2, GRID_STEP)
+    """Đếm cực đại địa phương của mật độ hỗn hợp trên lưới bước 0.001 (mục 3.2, Bước 1)."""
+    grid = np.arange(lo, hi + MODE_GRID_STEP / 2, MODE_GRID_STEP)
     dens = mix.pdf(grid)
     idx = argrelextrema(dens, np.greater)[0]
     return len(idx), grid[idx]
@@ -211,8 +220,22 @@ def count_modes(mix: MixParams, lo: float, hi: float) -> tuple[int, np.ndarray]:
 # ---------------------------------------------------------------------------
 # Bước 4 – Kiểm tra tính đơn điệu của Z*
 # ---------------------------------------------------------------------------
-def monotonicity_check(mix: MixParams, lo: float, hi: float):
-    """Quét lưới bước 0.01, trả về các khoảng mà Z* giảm."""
+def theorem1_check(x: np.ndarray, n_init: int = N_INIT, random_state: int = RANDOM_STATE) -> dict:
+    """Phép thử Δ ≤ 2σ của Định lý 1 (mục 4.3): khớp thêm mô hình hai thành phần
+    cùng phương sai (covariance_type='tied'), lấy Δ = μ₂ − μ₁ và σ chung."""
+    x = np.asarray(x, dtype=float)
+    g = fit_gmm(x, 2, n_init=n_init, random_state=random_state, cov_type="tied")
+    t = MixParams.from_gmm(g)
+    delta = float(t.means[1] - t.means[0])
+    sigma = float(t.sds[0])
+    return {"delta": delta, "sigma": sigma, "two_sigma": 2 * sigma,
+            "ratio": delta / sigma, "predict_monotone": bool(delta <= 2 * sigma),
+            "tied_params": t}
+
+
+def monotonicity_check(mix: MixParams, lo: float, hi: float, x: np.ndarray | None = None):
+    """Quét lưới bước 0.01, trả về các khoảng mà Z* giảm, kèm mức đảo tối đa và số HS trong vùng.
+    Nếu có x, khớp thêm mô hình 'tied' để đối chiếu với Định lý 1."""
     grid = np.round(np.arange(lo, hi + GRID_STEP / 2, GRID_STEP), 4)
     z = mix.z_soft(grid)
     dec = np.diff(z) < -1e-12
@@ -223,26 +246,32 @@ def monotonicity_check(mix: MixParams, lo: float, hi: float):
             j = i
             while j + 1 < len(dec) and dec[j + 1]:
                 j += 1
-            intervals.append((float(grid[i]), float(grid[j + 1])))
+            a, b = float(grid[i]), float(grid[j + 1])
+            drop = float(z[i] - z[j + 1])                       # mức đảo: Z*(a) − Z*(b)
+            n_in = int(np.sum((x >= a) & (x <= b))) if x is not None else None
+            intervals.append({"a": a, "b": b, "z_a": float(z[i]), "z_b": float(z[j + 1]),
+                              "drop": drop, "n_students": n_in})
             i = j + 1
         else:
             i += 1
-    # Điều kiện Δ ≤ 2σ của Định lý 1 (dùng σ gộp, chỉ để tham khảo khi k = 2)
-    theorem = None
-    if mix.k == 2:
-        delta = mix.means[1] - mix.means[0]
-        sigma_pool = float(np.sqrt(np.sum(mix.weights * mix.sds ** 2)))
-        theorem = {"delta": float(delta), "sigma_pool": sigma_pool,
-                   "ratio": float(delta / sigma_pool),
-                   "predict_monotone": bool(delta <= 2 * sigma_pool)}
-    return {"monotone": len(intervals) == 0, "intervals": intervals, "theorem": theorem}
+    max_drop = max((iv["drop"] for iv in intervals), default=0.0)
+    n_in_total = sum(iv["n_students"] for iv in intervals) if x is not None else None
+    theorem = theorem1_check(x) if x is not None else None
+    return {"monotone": len(intervals) == 0, "intervals": intervals,
+            "max_drop": max_drop, "n_students_in_reversal": n_in_total, "theorem": theorem}
 
 
 # ---------------------------------------------------------------------------
 # Bước 5 – ngưỡng x* tương đương
 # ---------------------------------------------------------------------------
-def _gamma_crossing(mix: MixParams, threshold: float, lo: float, hi: float) -> float | None:
-    """Nghiệm đầu tiên (tính từ điểm thấp) của γ_cao(x) = threshold, làm tròn 2 chữ số."""
+def x_star(mix: MixParams, threshold: float, lo: float, hi: float) -> float | None:
+    """Ngưỡng điểm x* tương đương với γ_cao(x*) = threshold.
+
+    Trả về nghiệm đầu tiên (tính từ điểm thấp) tại đó γ_cao cắt threshold theo chiều đi lên.
+    Vì γ_cao gần như tăng theo x, cùng một hàm dùng cho cả hai chiều:
+      - threshold cao (vd 0.7): học sinh có điểm > x* thuộc cụm cao với γ_cao > 0.7;
+      - threshold thấp (vd 0.3): học sinh có điểm < x* thuộc cụm thấp với γ_cao < 0.3.
+    Kết quả không làm tròn; giao diện tự làm tròn khi hiển thị."""
     grid = np.arange(lo, hi + GRID_STEP / 2, GRID_STEP)
     f = mix.gamma_high(grid) - threshold
     idx = np.where((f[:-1] < 0) & (f[1:] >= 0))[0]
@@ -250,17 +279,7 @@ def _gamma_crossing(mix: MixParams, threshold: float, lo: float, hi: float) -> f
         return None
     i = idx[0]
     root = brentq(lambda t: mix.gamma_high(np.array([t]))[0] - threshold, grid[i], grid[i + 1])
-    return round(float(root), 2)
-
-
-def x_star_high(mix: MixParams, threshold: float, lo: float, hi: float) -> float | None:
-    """Ngưỡng điểm x* tương đương với γ_cao = threshold (ngoại lệ chiều lên: điểm ≥ x*)."""
-    return _gamma_crossing(mix, threshold, lo, hi)
-
-
-def x_star_low(mix: MixParams, threshold: float, lo: float, hi: float) -> float | None:
-    """Ngưỡng điểm x* tương đương với γ_cao = threshold (ngoại lệ chiều xuống: điểm ≤ x*)."""
-    return _gamma_crossing(mix, threshold, lo, hi)
+    return float(root)
 
 
 # ---------------------------------------------------------------------------
@@ -308,7 +327,7 @@ def analyse_column(name: str, x: np.ndarray, groups: np.ndarray | None,
         scores["Z* (GMM mềm)"] = mix.z_soft(x)
         scores["Z_q (lượng tử hoá)"] = mix.z_quantile(x)
         scores["γ_cao"] = mix.gamma_high(x)
-        mono = monotonicity_check(mix, lo, hi)
+        mono = monotonicity_check(mix, lo, hi, x)
     else:
         # k = 1: Z_q trùng Z truyền thống (Φ⁻¹(Φ(z)) = z)
         scores["Z_q (lượng tử hoá)"] = z_trad
@@ -318,6 +337,23 @@ def analyse_column(name: str, x: np.ndarray, groups: np.ndarray | None,
 
 def official_index_name(res: ColumnResult) -> str:
     return "Z_q (lượng tử hoá)"
+
+
+def compare_progress(dz: np.ndarray, groups: np.ndarray) -> dict | None:
+    """So sánh ΔZ giữa hai nhóm: Welch t-test và Cohen's d (mục 4.6). Chỉ áp dụng khi đúng 2 nhóm."""
+    m = ~np.isnan(dz)
+    dz, groups = dz[m], groups[m]
+    names = list(pd_unique(groups))
+    if len(names) != 2:
+        return None
+    a, b = dz[groups == names[0]], dz[groups == names[1]]
+    if len(a) < 2 or len(b) < 2:
+        return None
+    t, p = stats.ttest_ind(a, b, equal_var=False)
+    sp = np.sqrt(((len(a) - 1) * a.var(ddof=1) + (len(b) - 1) * b.var(ddof=1)) / (len(a) + len(b) - 2))
+    d = (a.mean() - b.mean()) / sp if sp > 0 else 0.0
+    return {"groups": names, "n": (len(a), len(b)), "mean": (a.mean(), b.mean()),
+            "t": float(t), "p": float(p), "d": float(d)}
 
 
 # ===========================================================================
@@ -434,7 +470,7 @@ def guess_id_col(df: pd.DataFrame) -> str | None:
 # ===========================================================================
 """Biểu đồ matplotlib cho SmartZ-EDU."""
 
-import matplotlib
+import matplotlib  # noqa: E402
 
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
@@ -494,8 +530,8 @@ def plot_indices(res: ColumnResult):
         ax.plot(grid, res.mix.z_soft(grid), color="#f97316", lw=2, label="Z* (GMM mềm)")
         ax.plot(grid, res.mix.z_quantile(grid), color="#2563eb", lw=2.2, label="Z_q (lượng tử hoá)")
         if res.mono and not res.mono["monotone"]:
-            for a, b in res.mono["intervals"]:
-                ax.axvspan(a, b, color="#fecaca", alpha=0.6)
+            for iv in res.mono["intervals"]:
+                ax.axvspan(iv["a"], iv["b"], color="#fecaca", alpha=0.6)
             ax.plot([], [], color="#fecaca", lw=8, label="Vùng Z* giảm (không đơn điệu)")
     ax.set_xlabel("Điểm x")
     ax.set_ylabel("Giá trị chỉ số")
@@ -549,12 +585,7 @@ bằng Mô hình Hỗn hợp Gauss (GMM) và Z-score lượng tử hoá Z_q.
 Chạy cục bộ:   streamlit run app.py
 """
 
-import io
-from pathlib import Path
-
-import numpy as np
-import pandas as pd
-import streamlit as st
+import streamlit as st  # noqa: E402
 
 
 st.set_page_config(page_title="SmartZ-EDU", page_icon="📊", layout="wide")
@@ -728,28 +759,37 @@ with tab1:
             m1.metric("Số học sinh", len(res.x))
             m2.metric("Số thành phần k", res.k,
                       help="Chọn tự động theo BIC nhỏ nhất" if k_override is None else "Do người dùng cố định")
-            m3.metric("ΔBIC (k=1 → k=2)", fmt(d12), raftery_label(d12) if not np.isnan(d12) else None,
+            m3.metric("ΔBIC (k=1 → k=2)", fmt(d12),
+                      raftery_label(d12, favour=("k = 2", "k = 1")) if not np.isnan(d12) else None,
                       delta_color="off")
             m4.metric("Số đỉnh của phổ điểm", res.n_modes,
-                      help="Số cực đại của mật độ hỗn hợp đã ước lượng")
+                      help="Số cực đại của mật độ hỗn hợp đã ước lượng (lưới bước 0.001)")
 
             # --- Cảnh báo đơn điệu ---
             if res.k == 1:
                 st.info("Cơ chế thích ứng chọn **k = 1**: phổ điểm được mô tả tốt bởi một phân phối chuẩn. "
                         "Hệ thống dùng **Z-score truyền thống** (khi k = 1, Z_q trùng Z).")
             elif not res.mono["monotone"]:
-                iv = "; ".join(f"[{a:.2f}; {b:.2f}]" for a, b in res.mono["intervals"])
+                iv = "; ".join(f"[{v['a']:.2f}; {v['b']:.2f}]" for v in res.mono["intervals"])
+                worst = max(res.mono["intervals"], key=lambda v: v["drop"])
                 st.error(f"⚠️ **Phát hiện vùng không đơn điệu của Z\\***: trên khoảng điểm {iv}, "
                          "học sinh có điểm cao hơn lại nhận Z\\* thấp hơn. "
+                         f"Mức đảo tối đa **{res.mono['max_drop']:.3f}** đơn vị Z "
+                         f"(Z\\* = {worst['z_a']:.3f} tại {worst['a']:.2f} → {worst['z_b']:.3f} tại {worst['b']:.2f}); "
+                         f"**{res.mono['n_students_in_reversal']} học sinh** có điểm nằm trong vùng đảo. "
                          "Hệ thống **đã tự động chuyển sang Z_q** làm chỉ số chính thức.")
             else:
                 st.success("✅ Z\\* đơn điệu trên toàn thang điểm của dữ liệu này. "
                            "Chỉ số chính thức vẫn là **Z_q** (đơn điệu nghiêm ngặt với mọi tham số — Định lý 2).")
             th = res.mono["theorem"] if res.mono else None
             if th:
-                st.caption(f"Đối chiếu Định lý 1 (k = 2): Δ = {th['delta']:.2f}, σ gộp = {th['sigma_pool']:.2f}, "
-                           f"Δ/σ = {th['ratio']:.2f} → dự báo "
-                           f"{'đơn điệu' if th['predict_monotone'] else 'không đơn điệu'} (ngưỡng Δ/σ = 2).")
+                agree = th["predict_monotone"] == res.mono["monotone"]
+                st.caption(f"Đối chiếu Định lý 1 (mô hình hai thành phần cùng phương sai, 'tied'): "
+                           f"Δ = {th['delta']:.3f}, 2σ = {th['two_sigma']:.3f}, Δ/σ = {th['ratio']:.2f} → dự báo "
+                           f"**{'đơn điệu' if th['predict_monotone'] else 'không đơn điệu'}**; "
+                           f"quét lưới trên mô hình đã chọn (k = {res.k}, 'full'): "
+                           f"{'đơn điệu' if res.mono['monotone'] else 'không đơn điệu'} — "
+                           f"{'✔ trùng khớp' if agree else '✖ không trùng (phép thử chỉ là chẩn đoán xấp xỉ)'}.")
 
             left, right = st.columns([1.35, 1])
             with left:
@@ -793,7 +833,8 @@ with tab1:
                         "Kết luận": "Bác bỏ mô hình 1 thành phần" if r["p_value"] < 0.05 else "Chưa bác bỏ",
                     }]).style.format({"LRT quan sát": "{:.2f}", "Ngưỡng 95%": "{:.2f}"}),
                         hide_index=True, width="stretch")
-                    st.caption("Kiểm định chỉ khẳng định phổ điểm không phải một Gauss đơn; "
+                    st.caption(f"p nhỏ nhất có thể với B = {r['B']} là 1/(B + 1) = {r['p_min']:.4f}. "
+                               "Kiểm định chỉ khẳng định phổ điểm không phải một Gauss đơn; "
                                "nó không chứng minh phổ điểm có hai đỉnh.")
                 else:
                     st.caption("Bấm *Chạy kiểm định* (B = 500 mất khoảng 10 giây).")
@@ -829,8 +870,8 @@ with tab2:
         th_hi = a.slider("Ngưỡng γ_cao cho nhóm thấp (γ_cao >)", 0.50, 0.95, 0.70, 0.05)
         th_lo = b.slider("Ngưỡng γ_cao cho nhóm cao (γ_cao <)", 0.05, 0.50, 0.30, 0.05)
 
-        xh = x_star_high(res.mix, th_hi, res.lo, res.hi)
-        xl = x_star_low(res.mix, th_lo, res.lo, res.hi)
+        xh = x_star(res.mix, th_hi, res.lo, res.hi)
+        xl = x_star(res.mix, th_lo, res.lo, res.hi)
         gcol = sub[group_col].astype(str)
         up = sub[(gcol == g_low) & (sub["γ_cao"] > th_hi)].sort_values(c, ascending=False)
         down = sub[(gcol == g_high) & (sub["γ_cao"] < th_lo)].sort_values(c)
@@ -842,10 +883,10 @@ with tab2:
         m3.metric(f"{g_high} thuộc cụm điểm thấp", len(down))
         m4.metric("Ngưỡng điểm x* (cụm thấp)", fmt(xl))
         if xh is not None and xl is not None:
-            st.info(f"Diễn đạt tương đương: **{len(up)} học sinh {g_low}** đạt từ **{xh:.2f} điểm** trở lên — "
+            st.info(f"Diễn đạt tương đương: **{len(up)} học sinh {g_low}** đạt trên **{xh:.2f} điểm** — "
                     f"mức điểm mà theo cấu trúc phổ điểm của khối, đặc trưng cho cụm điểm cao; "
-                    f"**{len(down)} học sinh {g_high}** có điểm từ **{xl:.2f}** trở xuống — đặc trưng cho cụm điểm thấp. "
-                    "Ngưỡng x* do dữ liệu tự xác định.")
+                    f"**{len(down)} học sinh {g_high}** có điểm dưới **{xl:.2f}** — đặc trưng cho cụm điểm thấp. "
+                    "Ngưỡng x* do dữ liệu tự xác định (γ_cao(x*) đúng bằng ngưỡng đã chọn).")
 
         grid = np.linspace(res.lo, res.hi, 1001)
         gh = res.mix.gamma_high(grid)
@@ -892,6 +933,8 @@ with tab3:
             prog[c1], prog[c2] = df.loc[idx, c1], df.loc[idx, c2]
             prog[f"Z_q {c1}"], prog[f"Z_q {c2}"] = s1.loc[idx, ZQ], s2.loc[idx, ZQ]
             prog["ΔZ_q"] = prog[f"Z_q {c2}"] - prog[f"Z_q {c1}"]
+            ZT = "Z truyền thống"
+            prog["ΔZ truyền thống (đối chứng)"] = s2.loc[idx, ZT] - s1.loc[idx, ZT]
             has_zs = ZS in s1.columns and ZS in s2.columns
             if has_zs:
                 prog["ΔZ* (đối chứng)"] = s2.loc[idx, ZS] - s1.loc[idx, ZS]
@@ -914,14 +957,36 @@ with tab3:
             p1.pyplot(plot_progress(prog["ΔZ_q"].to_numpy(),
                                     str_values(prog[group_col]) if group_col else None), clear_figure=True)
             if group_col:
-                agg = {"ΔZ_q": ["count", "mean", "std"]}
-                if has_zs:
-                    agg["ΔZ* (đối chứng)"] = ["mean"]
-                g = prog.groupby(group_col).agg(agg)
-                g.columns = ["N", "ΔZ_q trung bình", "ΔZ_q độ lệch chuẩn"] + (["ΔZ* trung bình"] if has_zs else [])
+                cols_dz = ["ΔZ_q", "ΔZ truyền thống (đối chứng)"] + (["ΔZ* (đối chứng)"] if has_zs else [])
+                g = prog.groupby(group_col)[cols_dz].agg(["mean", "std"])
+                g.insert(0, "N", prog.groupby(group_col).size())
+                g.columns = ["N"] + [f"{a} {'TB' if b == 'mean' else 'ĐLC'}" for a, b in g.columns[1:]]
                 p2.markdown("**Theo loại hình lớp**")
                 p2.dataframe(g.style.format("{:.3f}", subset=[x for x in g.columns if x != "N"]),
                              width="stretch")
+
+                # Welch t-test và Cohen's d giữa hai loại hình lớp (mục 4.6 của báo cáo)
+                grp = str_values(prog[group_col])
+                rows = []
+                for lab in cols_dz:
+                    cmp = compare_progress(prog[lab].to_numpy(dtype=float), grp)
+                    if cmp is None:
+                        continue
+                    note = ""
+                    if lab.startswith("ΔZ*"):
+                        note = "không so sánh được (k khác nhau)" if r1.k != r2.k else \
+                               ("chỉ đối chứng (Z* không đơn điệu)" if any(r.mono and not r.mono["monotone"] for r in (r1, r2)) else "")
+                    rows.append({"Chỉ số": lab.replace(" (đối chứng)", ""),
+                                 f"TB {cmp['groups'][0]}": cmp["mean"][0], f"TB {cmp['groups'][1]}": cmp["mean"][1],
+                                 "Cohen's d": cmp["d"], "Welch t": cmp["t"], "p": cmp["p"], "Ghi chú": note})
+                if rows:
+                    p2.markdown("**Khác biệt tiến bộ giữa hai loại hình lớp** (Welch t-test, Cohen's d)")
+                    cmp_df = pd.DataFrame(rows)
+                    p2.dataframe(cmp_df.style.format({k: "{:.3f}" for k in cmp_df.columns
+                                                      if k not in ("Chỉ số", "Ghi chú", "p")} | {"p": "{:.4f}"}),
+                                 hide_index=True, width="stretch")
+                    p2.caption("Kết luận chính thức dựa trên ΔZ_q. ΔZ* và ΔZ truyền thống chỉ để đối chứng: "
+                               "khi Z* không đơn điệu, ΔZ* có thể tạo ra khác biệt giả.")
 
             fm = {k: "{:.2f}" for k in prog.columns if k not in (id_col, group_col)}
             t1, t2 = st.columns(2)
@@ -943,13 +1008,14 @@ with tab4:
             if name in sub.columns:
                 out.loc[sub.index, f"{name} [{c}]"] = sub[name]
         mono_txt = "—" if res.k == 1 else ("Có" if res.mono["monotone"] else
-                                           "Không: " + "; ".join(f"[{a:.2f};{b:.2f}]" for a, b in res.mono["intervals"]))
+                                           "Không: " + "; ".join(f"[{v['a']:.2f};{v['b']:.2f}]" for v in res.mono["intervals"])
+                                           + f" (mức đảo tối đa {res.mono['max_drop']:.3f}; {res.mono['n_students_in_reversal']} HS trong vùng)")
         summary_rows.append({
             "Cột điểm": c, "N": len(res.x), "k được chọn": res.k,
             "ΔBIC (1→2)": res.selection["delta_1_to_2"], "Mức bằng chứng": raftery_label(res.selection["delta_1_to_2"]),
             "Số đỉnh": res.n_modes, "Z* đơn điệu": mono_txt,
-            "x* cụm cao (γ>0.7)": x_star_high(res.mix, 0.7, res.lo, res.hi) if res.k >= 2 else None,
-            "x* cụm thấp (γ<0.3)": x_star_low(res.mix, 0.3, res.lo, res.hi) if res.k >= 2 else None,
+            "x* cụm cao (γ>0.7)": fmt(x_star(res.mix, 0.7, res.lo, res.hi)) if res.k >= 2 else "—",
+            "x* cụm thấp (γ<0.3)": fmt(x_star(res.mix, 0.3, res.lo, res.hi)) if res.k >= 2 else "—",
             "Chỉ số chính thức": "Z truyền thống" if res.k == 1 else "Z_q",
             "Tham số (π; μ; σ)": " | ".join(f"{w:.3f}; {m:.2f}; {s:.2f}"
                                             for w, m, s in zip(res.mix.weights, res.mix.means, res.mix.sds)),
@@ -1001,7 +1067,10 @@ with tab5:
     st.latex(r"Z_q = \Phi^{-1}\!\big(F_{mix}(x)\big),\qquad F_{mix}(x)=\sum_{j=1}^{K}\pi_j\,\Phi\!\Big(\frac{x-\mu_j}{\sigma_j}\Big)")
     st.markdown(
         "**Định lý 1.** Với hai thành phần cùng phương sai σ, Z\\* đơn điệu tăng trên toàn trục số "
-        "khi và chỉ khi Δ = |μ₂ − μ₁| ≤ 2σ.\n\n"
+        "khi và chỉ khi Δ = |μ₂ − μ₁| ≤ 2σ. Tương đương: Z\\* = −σ·(ln f_mix)′, nên Z\\* đơn điệu khi và chỉ khi "
+        "mật độ hỗn hợp log-lõm — trùng với điều kiện đã biết trong tài liệu (Cule–Samworth–Stewart 2010; Dunn và cộng sự). "
+        "Trên dữ liệu thực (σ khác nhau hoặc k > 2) phép thử Δ ≤ 2σ với mô hình 'tied' chỉ là chẩn đoán xấp xỉ; "
+        "kết luận cuối cùng luôn dựa vào quét lưới trên mô hình đã chọn.\n\n"
         "**Định lý 2.** Với mọi tham số (π_j > 0, σ_j > 0), Z_q đơn điệu tăng nghiêm ngặt — "
         "không bao giờ đảo ngược thứ tự điểm số.\n\n"
         "**Lưu ý về phạm vi ý nghĩa.** Vì Z_q là phép biến đổi đơn điệu của điểm, thứ hạng theo Z_q trùng "
@@ -1009,4 +1078,13 @@ with tab5:
         "khả năng so sánh giữa các đợt đánh giá, và các đại lượng phụ trợ như γ.")
     st.markdown("### Tái lập")
     st.code("GaussianMixture(n_components=k, covariance_type='full', n_init=20, random_state=42)", language="python")
+    st.markdown(
+        "- Phép thử Δ ≤ 2σ (Định lý 1): khớp thêm `covariance_type='tied'`, k = 2, cùng seed.\n"
+        "- Bootstrap LRT: mô hình quan sát n_init = 20; mỗi mẫu giả n_init = 5 (seed = 42 + b). "
+        "p nhỏ nhất có thể là 1/(B + 1).\n"
+        "- Z truyền thống và Z theo nhóm dùng độ lệch chuẩn tổng thể (chia cho n); "
+        "thống kê mô tả dùng độ lệch chuẩn mẫu (chia cho n − 1).\n"
+        "- Quét đơn điệu: lưới bước 0.01 trên [min(0, x_min), max(10, x_max)]; đếm đỉnh: lưới bước 0.001.\n"
+        "- Ngoại lệ sư phạm: lớp thường có γ_cao > 0.7 (mặc định), lớp chuyên có γ_cao < 0.3; "
+        "x\\* là nghiệm của γ_cao(x) = ngưỡng.")
     st.caption(DISCLAIMER)
