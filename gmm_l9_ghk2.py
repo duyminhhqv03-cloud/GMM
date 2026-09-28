@@ -1,6 +1,6 @@
 """
 SmartZ-EDU — bản một file (single-file) để deploy lên Streamlit Community Cloud.
-Chuẩn hoá điểm số khi phổ điểm không thuần nhất bằng GMM thích ứng và Z-score lượng tử hoá Z_q.
+Chuẩn hoá điểm số khi phổ điểm không thuần nhất bằng GMM thích ứng và chỉ số biến đổi phân vị Z_q.
 """
 from __future__ import annotations
 
@@ -27,7 +27,7 @@ Lõi tính toán của SmartZ-EDU.
 Toàn bộ công thức bám sát mục 3.2 – 3.4 của báo cáo:
   - Cơ chế thích ứng: GMM k = 1..4, chọn k có BIC nhỏ nhất, diễn giải ΔBIC theo thang Raftery.
   - Kiểm định tỉ số hợp lý bằng bootstrap tham số (k = 1 so với k = 2).
-  - Ba chỉ số: Z truyền thống, Z* (GMM mềm), Z_q (lượng tử hoá theo hỗn hợp).
+  - Ba chỉ số: Z truyền thống, Z* (trọng số hậu nghiệm), Z_q (biến đổi phân vị theo hỗn hợp).
   - Kiểm tra tính đơn điệu của Z* trên lưới bước 0.01; đếm số đỉnh trên lưới bước 0.001.
   - Phép thử Δ ≤ 2σ (Định lý 1) trên mô hình 'tied' khớp thêm, đúng như mục 4.3 của báo cáo.
   - γ_cao, ngưỡng điểm x* tương đương, ngoại lệ sư phạm.
@@ -42,6 +42,10 @@ COV_TYPE = "full"
 K_MAX = 4
 GRID_STEP = 0.01         # quét đơn điệu Z* (mục 3.2, Bước 4)
 MODE_GRID_STEP = 0.001   # đếm số đỉnh mật độ (mục 3.2, Bước 1)
+
+# Tên chỉ số dùng thống nhất trong toàn bộ ứng dụng và file Excel (khớp báo cáo, mục 3.2 Bước 3)
+ZS = "Z* (trọng số hậu nghiệm)"
+ZQ = "Z_q (biến đổi phân vị)"
 
 
 # ---------------------------------------------------------------------------
@@ -125,7 +129,7 @@ class MixParams:
         return (self.gamma(x) * zj).sum(axis=1)
 
     def z_quantile(self, x):
-        """Z_q = Φ⁻¹(F_mix(x)) — luôn đơn điệu tăng nghiêm ngặt (Định lý 2)."""
+        """Z_q = Φ⁻¹(F_mix(x)) — luôn đơn điệu tăng nghiêm ngặt (Mệnh đề 2)."""
         F = np.clip(self.cdf(x), 1e-12, 1 - 1e-12)
         return stats.norm.ppf(F)
 
@@ -324,19 +328,19 @@ def analyse_column(name: str, x: np.ndarray, groups: np.ndarray | None,
 
     mono = None
     if k >= 2:
-        scores["Z* (GMM mềm)"] = mix.z_soft(x)
-        scores["Z_q (lượng tử hoá)"] = mix.z_quantile(x)
+        scores[ZS] = mix.z_soft(x)
+        scores[ZQ] = mix.z_quantile(x)
         scores["γ_cao"] = mix.gamma_high(x)
         mono = monotonicity_check(mix, lo, hi, x)
     else:
         # k = 1: Z_q trùng Z truyền thống (Φ⁻¹(Φ(z)) = z)
-        scores["Z_q (lượng tử hoá)"] = z_trad
+        scores[ZQ] = z_trad
 
     return ColumnResult(name, x, sel, k, mix, lo, hi, mono, n_modes, mode_locs, scores)
 
 
 def official_index_name(res: ColumnResult) -> str:
-    return "Z_q (lượng tử hoá)"
+    return ZQ
 
 
 def compare_progress(dz: np.ndarray, groups: np.ndarray) -> dict | None:
@@ -527,8 +531,8 @@ def plot_indices(res: ColumnResult):
     mu, sd = res.x.mean(), res.x.std(ddof=0)
     ax.plot(grid, (grid - mu) / sd, color="#64748b", lw=1.5, label="Z truyền thống")
     if res.k >= 2:
-        ax.plot(grid, res.mix.z_soft(grid), color="#f97316", lw=2, label="Z* (GMM mềm)")
-        ax.plot(grid, res.mix.z_quantile(grid), color="#2563eb", lw=2.2, label="Z_q (lượng tử hoá)")
+        ax.plot(grid, res.mix.z_soft(grid), color="#f97316", lw=2, label=ZS)
+        ax.plot(grid, res.mix.z_quantile(grid), color="#2563eb", lw=2.2, label=ZQ)
         if res.mono and not res.mono["monotone"]:
             for iv in res.mono["intervals"]:
                 ax.axvspan(iv["a"], iv["b"], color="#fecaca", alpha=0.6)
@@ -580,7 +584,7 @@ def plot_progress(dz, groups=None, label="ΔZ_q"):
 # ===========================================================================
 """
 SmartZ-EDU — Chuẩn hoá điểm số khi phổ điểm không thuần nhất
-bằng Mô hình Hỗn hợp Gauss (GMM) và Z-score lượng tử hoá Z_q.
+bằng Mô hình Hỗn hợp Gauss (GMM) và chỉ số biến đổi phân vị Z_q.
 
 Chạy cục bộ:   streamlit run app.py
 """
@@ -594,8 +598,6 @@ _HERE = Path(__file__).parent
 SAMPLE_PATH = next((p for p in [_HERE / "data" / "Diem_GK_CK_An_Danh_4Khoi.xlsx",
                      _HERE / "Diem_GK_CK_An_Danh_4Khoi.xlsx"] if p.exists()),
                     _HERE / "data" / "Diem_GK_CK_An_Danh_4Khoi.xlsx")
-ZQ = "Z_q (lượng tử hoá)"
-ZS = "Z* (GMM mềm)"
 
 DISCLAIMER = (
     "**Khuyến cáo sử dụng.** Kết quả, đặc biệt là danh sách *ngoại lệ sư phạm*, "
@@ -648,7 +650,7 @@ def fmt(v, nd=2):
 # ---------------------------------------------------------------------------
 with st.sidebar:
     st.markdown("## 📊 SmartZ-EDU")
-    st.caption("Chuẩn hoá điểm số bằng GMM thích ứng và Z-score lượng tử hoá")
+    st.caption("Chuẩn hoá điểm số bằng GMM thích ứng và chỉ số biến đổi phân vị Z_q")
 
     source = st.radio("Nguồn dữ liệu", ["Tải file lên", "Dùng dữ liệu mẫu"], horizontal=True)
     file_bytes, filename = None, None
@@ -702,7 +704,7 @@ with st.sidebar:
 # Trang chào
 # ---------------------------------------------------------------------------
 st.title("SmartZ-EDU")
-st.markdown("##### Chuẩn hoá điểm số khi phổ điểm không thuần nhất — GMM thích ứng & Z-score lượng tử hoá")
+st.markdown("##### Chuẩn hoá điểm số khi phổ điểm không thuần nhất — GMM thích ứng & chỉ số biến đổi phân vị Z_q")
 
 if df is None:
     st.info("👈 Tải file điểm lên ở thanh bên, hoặc chọn **Dùng dữ liệu mẫu** để xem thử.")
@@ -780,7 +782,7 @@ with tab1:
                          "Hệ thống **đã tự động chuyển sang Z_q** làm chỉ số chính thức.")
             else:
                 st.success("✅ Z\\* đơn điệu trên toàn thang điểm của dữ liệu này. "
-                           "Chỉ số chính thức vẫn là **Z_q** (đơn điệu nghiêm ngặt với mọi tham số — Định lý 2).")
+                           "Chỉ số chính thức vẫn là **Z_q** (đơn điệu nghiêm ngặt với mọi tham số — Mệnh đề 2).")
             th = res.mono["theorem"] if res.mono else None
             if th:
                 agree = th["predict_monotone"] == res.mono["monotone"]
@@ -1057,7 +1059,7 @@ with tab5:
         "bằng bootstrap tham số (k = 1 so với k = 2).\n"
         "2. **Cơ chế thích ứng tự động** — ước lượng GMM với k = 1…4, chọn k có BIC nhỏ nhất, diễn giải ΔBIC "
         "theo thang Raftery. Nếu k = 1 dùng Z truyền thống.\n"
-        "3. **Xây dựng chỉ số** — Z truyền thống, Z\\* (GMM mềm), Z_q (lượng tử hoá), kèm Z theo nhóm hành chính.\n"
+        "3. **Xây dựng chỉ số** — Z truyền thống, Z\\* (trọng số hậu nghiệm), Z_q (biến đổi phân vị), kèm Z theo nhóm hành chính.\n"
         "4. **Kiểm tra tính đơn điệu** — quét lưới bước 0.01; nếu Z\\* có đoạn giảm thì cảnh báo và dùng Z_q.\n"
         "5. **Ngoại lệ sư phạm & tiến bộ** — γ_cao, ngưỡng điểm x\\* tương đương, ΔZ_q.")
     st.markdown("### Công thức")
@@ -1068,10 +1070,10 @@ with tab5:
     st.markdown(
         "**Định lý 1.** Với hai thành phần cùng phương sai σ, Z\\* đơn điệu tăng trên toàn trục số "
         "khi và chỉ khi Δ = |μ₂ − μ₁| ≤ 2σ. Tương đương: Z\\* = −σ·(ln f_mix)′, nên Z\\* đơn điệu khi và chỉ khi "
-        "mật độ hỗn hợp log-lõm — trùng với điều kiện đã biết trong tài liệu (Cule–Samworth–Stewart 2010; Dunn và cộng sự). "
+        "mật độ hỗn hợp log-lõm — trùng với điều kiện đã biết trong tài liệu (Cule–Samworth–Stewart 2010; Dunn và cộng sự 2025). "
         "Trên dữ liệu thực (σ khác nhau hoặc k > 2) phép thử Δ ≤ 2σ với mô hình 'tied' chỉ là chẩn đoán xấp xỉ; "
         "kết luận cuối cùng luôn dựa vào quét lưới trên mô hình đã chọn.\n\n"
-        "**Định lý 2.** Với mọi tham số (π_j > 0, σ_j > 0), Z_q đơn điệu tăng nghiêm ngặt — "
+        "**Mệnh đề 2.** Với mọi tham số (π_j > 0, σ_j > 0), Z_q đơn điệu tăng nghiêm ngặt — "
         "không bao giờ đảo ngược thứ tự điểm số.\n\n"
         "**Lưu ý về phạm vi ý nghĩa.** Vì Z_q là phép biến đổi đơn điệu của điểm, thứ hạng theo Z_q trùng "
         "thứ hạng theo điểm thô trong cùng một đợt. Giá trị của Z_q nằm ở thang đo có ý nghĩa xác suất đúng, "
@@ -1085,6 +1087,7 @@ with tab5:
         "- Z truyền thống và Z theo nhóm dùng độ lệch chuẩn tổng thể (chia cho n); "
         "thống kê mô tả dùng độ lệch chuẩn mẫu (chia cho n − 1).\n"
         "- Quét đơn điệu: lưới bước 0.01 trên [min(0, x_min), max(10, x_max)]; đếm đỉnh: lưới bước 0.001.\n"
-        "- Ngoại lệ sư phạm: lớp thường có γ_cao > 0.7 (mặc định), lớp chuyên có γ_cao < 0.3; "
+        "- Ngoại lệ sư phạm: nhóm có mặt bằng thấp hơn (vd. Lớp hai buổi) có γ_cao > 0.7 (mặc định), "
+        "nhóm có mặt bằng cao hơn (vd. Lớp TC) có γ_cao < 0.3; "
         "x\\* là nghiệm của γ_cao(x) = ngưỡng.")
     st.caption(DISCLAIMER)
