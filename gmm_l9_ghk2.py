@@ -853,7 +853,7 @@ with tab1:
 # ---------------------------------------------------------------------------
 outlier_tables = {}
 with tab2:
-    c = st.selectbox("Cột điểm", score_cols, key="out_col")
+    c = st.selectbox("Cột điểm", score_cols, key=f"out_col::{filename}::{'|'.join(map(str, score_cols))}")
     res, sub = results[c], subsets[c]
     if res.k < 2:
         st.warning("Cột điểm này có k = 1 (không có cấu trúc hỗn hợp) nên không xác định được cụm điểm cao/thấp.")
@@ -903,8 +903,9 @@ with tab2:
 
         show_cols = [x for x in [id_col] if x] + [k for k in sub.columns if k.lower().strip() == "lớp"] + \
                     [group_col, c, "γ_cao", ZQ]
-        show_cols = list(dict.fromkeys(show_cols))
-        fmt_map = {c: "{:.2f}", "γ_cao": "{:.3f}", ZQ: "{:.2f}"}
+        # Chỉ giữ các cột thật sự có trong bảng (file tải lên có thể không có cột mã HS / "Lớp"...)
+        show_cols = [k for k in dict.fromkeys(show_cols) if k in sub.columns]
+        fmt_map = {k: v for k, v in {c: "{:.2f}", "γ_cao": "{:.3f}", ZQ: "{:.2f}"}.items() if k in show_cols}
         t1, t2 = st.columns(2)
         with t1:
             st.markdown(f"**{g_low} có γ_cao > {th_hi:.2f}** ({len(up)} học sinh)")
