@@ -620,8 +620,11 @@ def get_sheets(file_bytes: bytes, filename: str):
     return list_sheets(file_bytes, filename)
 
 
+CACHE_VERSION = "2026-09-28b"   # đổi chuỗi này mỗi khi sửa lõi tính toán để bỏ cache cũ
+
+
 @st.cache_data(show_spinner=False)
-def _run_analysis_cached(name: str, x_t: tuple, g_t, k_override):
+def _run_analysis_cached(name: str, x_t: tuple, g_t, k_override, version: str = CACHE_VERSION):
     x = np.asarray(x_t, dtype=float)
     g = None if g_t is None else np.array(g_t, dtype=object)
     return analyse_column(name, x, g, k_override=k_override)
@@ -631,7 +634,7 @@ def run_analysis(name, x, groups, k_override):
     """Chuyển dữ liệu về tuple thuần để Streamlit băm được (tương thích pandas 3 / Python 3.14)."""
     x_t = tuple(float(v) for v in np.asarray(x, dtype=float))
     g_t = None if groups is None else tuple(str(v) for v in groups)
-    return _run_analysis_cached(str(name), x_t, g_t, k_override)
+    return _run_analysis_cached(str(name), x_t, g_t, k_override, CACHE_VERSION)
 
 
 def str_values(series) -> np.ndarray:
@@ -739,6 +742,11 @@ with st.spinner("Đang ước lượng mô hình hỗn hợp Gauss…"):
             st.stop()
         groups = str_values(sub[group_col]) if group_col else None
         res = run_analysis(c, sub[c].to_numpy(dtype=float), groups, k_override)
+        if ZQ not in res.scores:
+            res.scores[ZQ] = (res.mix.z_quantile(res.x) if res.k >= 2
+                              else (res.x - res.x.mean()) / res.x.std(ddof=0))
+        if "Z truyền thống" not in res.scores:
+            res.scores["Z truyền thống"] = (res.x - res.x.mean()) / res.x.std(ddof=0)
         for name, vals in res.scores.items():
             sub[name] = vals
         results[c], subsets[c] = res, sub
@@ -934,13 +942,24 @@ with tab3:
             idx = s1.index.intersection(s2.index)
             prog = df.loc[idx, [x for x in [id_col, group_col] if x]].copy()
             prog[c1], prog[c2] = df.loc[idx, c1], df.loc[idx, c2]
-            prog[f"Z_q {c1}"], prog[f"Z_q {c2}"] = s1.loc[idx, ZQ], s2.loc[idx, ZQ]
-            prog["ΔZ_q"] = prog[f"Z_q {c2}"] - prog[f"Z_q {c1}"]
+            def _idx_score(r, s, name):
+                """Chỉ số `name` của một cột điểm, căn theo chỉ mục học sinh; None nếu không có."""
+                if name in s.columns:
+                    return s[name].reindex(idx)
+                if name in r.scores:
+                    return pd.Series(np.asarray(r.scores[name], dtype=float), index=s.index).reindex(idx)
+                return None
+
             ZT = "Z truyền thống"
-            prog["ΔZ truyền thống (đối chứng)"] = s2.loc[idx, ZT] - s1.loc[idx, ZT]
-            has_zs = ZS in s1.columns and ZS in s2.columns
+            q1, q2 = _idx_score(r1, s1, ZQ), _idx_score(r2, s2, ZQ)
+            prog[f"Z_q {c1}"], prog[f"Z_q {c2}"] = q1, q2
+            prog["ΔZ_q"] = prog[f"Z_q {c2}"] - prog[f"Z_q {c1}"]
+            t1_, t2_ = _idx_score(r1, s1, ZT), _idx_score(r2, s2, ZT)
+            prog["ΔZ truyền thống (đối chứng)"] = t2_ - t1_
+            zs1, zs2 = _idx_score(r1, s1, ZS), _idx_score(r2, s2, ZS)
+            has_zs = zs1 is not None and zs2 is not None
             if has_zs:
-                prog["ΔZ* (đối chứng)"] = s2.loc[idx, ZS] - s1.loc[idx, ZS]
+                prog["ΔZ* (đối chứng)"] = zs2 - zs1
             progress_df = prog
 
             if r1.k != r2.k:
